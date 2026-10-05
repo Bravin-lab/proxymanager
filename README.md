@@ -60,6 +60,10 @@ sudo ./proxymanager.sh
 ```bash
 menu
 ```
+### one line command
+```
+git clone https://github.com/Bravin-lab/proxymanager && cd proxymanager && chmod +x proxymanager.sh && sudo ./proxymanager.sh
+```
 > The script automatically creates a `menu` command on first launch.
 
 ---
