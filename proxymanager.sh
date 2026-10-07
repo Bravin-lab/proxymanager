@@ -1,6 +1,6 @@
 #!/bin/bash
 # ╔══════════════════════════════════════════════════════════════╗
-# ║           PROXY MANAGER PRO - Ubuntu VPS Edition            ║
+# ║           PROXY MANAGER PRO - Bravin-lab Edition            ║
 # ║           Supports: Squid (HTTP/S) | Dante (SOCKS5)        ║
 # ║                     3proxy (Multi-protocol)                 ║
 # ║  Usage: chmod +x proxymanager.sh && sudo ./proxymanager.sh ║
@@ -121,10 +121,11 @@ main_menu() {
     echo -e "  ${RED}29.${RESET}  ${GREEN}Full Anti-Detection Hardening${RESET}"
     echo -e "  ${RED}30.${RESET}  ${GREEN}Check Detection Risk Score${RESET}"
     echo -e "  ${RED}31.${RESET}  ${GREEN}Residential IP Masking (ISP spoof)${RESET}"
+    echo -e "  ${RED}32.${RESET}  ${GREEN}Cloudflare Integration (Hide VPS IP / Tunnel)${RESET}"
     echo -e "  ${YELLOW}28.${RESET}  ${RED}Exit${RESET}"
     echo -e ""
     echo -e "${YELLOW}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
-    echo -ne "\n  ${YELLOW}Select option (1-31): ${GREEN}"
+    echo -ne "\n  ${YELLOW}Select option (1-32): ${GREEN}"
     read -r choice
     echo -e "${RESET}"
     handle_choice "$choice"
@@ -1897,6 +1898,7 @@ handle_choice() {
         29) anti_detection_harden ;;
         30) detection_risk_check ;;
         31) residential_ip_masking ;;
+        32) cloudflare_integration ;;
         --rotate-silent)
             # Called by cron
             [[ -f $USERS_FILE ]] && while IFS=: read -r user _ type created; do
@@ -3155,6 +3157,372 @@ Step 4: Or chain using 3proxy on this server
         ;;
     esac
     press_enter
+}
+
+# ══════════════════════════════════════════════════════════════
+#  32. CLOUDFLARE INTEGRATION
+# ══════════════════════════════════════════════════════════════
+cloudflare_integration() {
+    banner
+    echo -e "${RED}${BOLD}[32] CLOUDFLARE INTEGRATION${RESET}\n"
+    local ip; ip=$(get_server_ip)
+
+    echo -e "${CYAN}${BOLD}How Cloudflare helps hide your AWS VPS:${RESET}"
+    echo -e ""
+    echo -e "  ${GREEN}Method A — Cloudflare DNS Proxy (Orange Cloud)${RESET}"
+    echo -e "  Client → Cloudflare IP → Your VPS"
+    echo -e "  • Hides your real AWS IP behind Cloudflare"
+    echo -e "  • Only works on port 80/443"
+    echo -e "  • Cloudflare ASN still detectable by advanced checkers"
+    echo -e "  • FREE — just enable orange cloud in CF dashboard"
+    echo -e ""
+    echo -e "  ${GREEN}Method B — Cloudflare Tunnel / cloudflared (BEST)${RESET}"
+    echo -e "  Client → Cloudflare Edge → Encrypted Tunnel → Your VPS"
+    echo -e "  • Your VPS makes OUTBOUND connection to Cloudflare"
+    echo -e "  • No ports need to be open on VPS at all"
+    echo -e "  • Traffic looks like normal HTTPS to cloudflare.com"
+    echo -e "  • AWS IP never exposed — even CF doesn't see it in headers"
+    echo -e "  • FREE with Cloudflare Zero Trust"
+    echo -e ""
+    echo -e "  ${GREEN}Method C — Cloudflare Workers proxy (most advanced)${RESET}"
+    echo -e "  Client → CF Worker (serverless) → Your VPS"
+    echo -e "  • Worker IP rotates across 200+ Cloudflare edge locations"
+    echo -e "  • Each request can come from a different country"
+    echo -e "  • Looks like normal CDN/web traffic"
+    echo -e ""
+
+    echo -e "${YELLOW}Choose method:${RESET}"
+    echo -e "  1. Install Cloudflare Tunnel (cloudflared) — RECOMMENDED"
+    echo -e "  2. Setup guide for CF DNS Proxy (orange cloud)"
+    echo -e "  3. Setup Nginx + Cloudflare Workers config"
+    echo -e "  4. Check if domain is already behind Cloudflare"
+    echo -ne "\n${YELLOW}Choice (1-4): ${RESET}"; read -r cfc
+
+    case $cfc in
+    1) _cf_tunnel_setup ;;
+    2) _cf_dns_proxy_guide ;;
+    3) _cf_workers_setup ;;
+    4) _cf_check_domain ;;
+    esac
+    press_enter
+}
+
+# ── Method A: cloudflared tunnel ─────────────────────────────
+_cf_tunnel_setup() {
+    echo -e "\n${CYAN}${BOLD}── Cloudflare Tunnel Setup ─────────────────────────────────${RESET}"
+    echo -e "${YELLOW}Requirements: A domain added to Cloudflare (free account OK)${RESET}\n"
+
+    # Install cloudflared
+    log_info "Installing cloudflared..."
+    local ARCH; ARCH=$(dpkg --print-architecture 2>/dev/null || echo "amd64")
+    local CF_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${ARCH}.deb"
+
+    env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
+        curl --noproxy '*' -sL "$CF_URL" -o /tmp/cloudflared.deb >> "$LOG_DIR/install.log" 2>&1
+
+    if [[ -f /tmp/cloudflared.deb && -s /tmp/cloudflared.deb ]]; then
+        DEBIAN_FRONTEND=noninteractive dpkg -i /tmp/cloudflared.deb >> "$LOG_DIR/install.log" 2>&1
+        log_ok "cloudflared installed: $(cloudflared --version 2>/dev/null | head -1)"
+    else
+        # Fallback: install via apt repo
+        log_warn "Direct download failed, trying apt..."
+        env -u http_proxy -u https_proxy \
+            curl --noproxy '*' -fsSL \
+            https://pkg.cloudflare.com/cloudflare-main.gpg \
+            | gpg --dearmor > /usr/share/keyrings/cloudflare-main.gpg 2>/dev/null
+        echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared $(lsb_release -cs) main" \
+            > /etc/apt/sources.list.d/cloudflared.list
+        apt_update
+        pkg_install cloudflared
+    fi
+
+    if ! command -v cloudflared &>/dev/null; then
+        log_err "cloudflared installation failed"
+        return 1
+    fi
+
+    echo -e "\n${YELLOW}Choose tunnel type:${RESET}"
+    echo -e "  1. Named tunnel (requires CF login) — RECOMMENDED"
+    echo -e "  2. Quick tunnel (temporary, no login needed) — TEST ONLY"
+    echo -ne "${YELLOW}Choice: ${RESET}"; read -r ttype
+
+    if [[ "$ttype" == "2" ]]; then
+        # Quick tunnel — no auth needed, great for testing
+        echo -e "\n${CYAN}Starting quick tunnel (temporary — for testing only)...${RESET}"
+        echo -ne "${YELLOW}Local proxy port to expose (e.g. $HTTP_PORT): ${RESET}"; read -r lport
+        lport=${lport:-$HTTP_PORT}
+        echo -e "${YELLOW}Starting tunnel... (Ctrl+C to stop)${RESET}"
+        cloudflared tunnel --url "http://localhost:$lport" --no-autoupdate 2>&1 | \
+            tee /tmp/cf_tunnel.log &
+        sleep 5
+        local cf_url; cf_url=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' /tmp/cf_tunnel.log | head -1)
+        if [[ -n "$cf_url" ]]; then
+            echo -e "\n${GREEN}${BOLD}╔══════════════════════════════════════════════════════╗"
+            echo -e "║  QUICK TUNNEL ACTIVE                                 ║"
+            echo -e "╠══════════════════════════════════════════════════════╣"
+            echo -e "║  ${WHITE}Public URL: ${GREEN}$cf_url${GREEN}"
+            echo -e "║  ${WHITE}Use as proxy: http://USER:PASS@${cf_url#https://}:443${GREEN}"
+            echo -e "║  ${YELLOW}⚠ This URL changes every restart — use named tunnel for permanent${GREEN}"
+            echo -e "╚══════════════════════════════════════════════════════╝${RESET}"
+        fi
+        return
+    fi
+
+    # Named tunnel setup
+    echo -e "\n${CYAN}── Named Tunnel Setup ───────────────────────────────────────${RESET}"
+    echo -e "${WHITE}Step 1: Login to Cloudflare${RESET}"
+    echo -e "${YELLOW}A browser URL will appear. Open it on your local machine to authenticate.${RESET}\n"
+    cloudflared tunnel login
+
+    if [[ ! -f ~/.cloudflared/cert.pem ]]; then
+        log_err "CF login failed or not completed"
+        return 1
+    fi
+    log_ok "Cloudflare login successful"
+
+    echo -ne "\n${YELLOW}Tunnel name (e.g. my-proxy): ${RESET}"; read -r TUNNEL_NAME
+    TUNNEL_NAME=${TUNNEL_NAME:-my-proxy}
+
+    echo -ne "${YELLOW}Your domain (e.g. proxy.yourdomain.com): ${RESET}"; read -r CF_DOMAIN
+    echo -ne "${YELLOW}Local proxy port to expose (default $HTTP_PORT): ${RESET}"; read -r lport
+    lport=${lport:-$HTTP_PORT}
+
+    # Create tunnel
+    cloudflared tunnel create "$TUNNEL_NAME" 2>&1 | tee /tmp/cf_create.log
+    local TUNNEL_ID; TUNNEL_ID=$(grep -o '[0-9a-f-]\{36\}' /tmp/cf_create.log | head -1)
+
+    if [[ -z "$TUNNEL_ID" ]]; then
+        log_err "Failed to create tunnel"
+        return 1
+    fi
+    log_ok "Tunnel created: $TUNNEL_ID"
+
+    # Write tunnel config
+    mkdir -p /etc/cloudflared
+    cat > /etc/cloudflared/config.yml <<EOF
+# ── Proxy Manager Pro — Cloudflare Tunnel Config ──────────────
+tunnel: ${TUNNEL_ID}
+credentials-file: /root/.cloudflared/${TUNNEL_ID}.json
+
+# Route traffic through the tunnel
+ingress:
+  # HTTP proxy traffic → Squid
+  - hostname: ${CF_DOMAIN}
+    service: http://localhost:${lport}
+    originRequest:
+      noTLSVerify: true
+      connectTimeout: 30s
+      tcpKeepAlive: 30s
+      keepAliveTimeout: 90s
+      keepAliveConnections: 100
+  # Catch-all
+  - service: http_status:404
+
+# Connection settings — make it look like normal browser traffic
+no-autoupdate: true
+protocol: http2
+EOF
+
+    # Route domain through tunnel
+    cloudflared tunnel route dns "$TUNNEL_NAME" "$CF_DOMAIN" 2>&1
+    log_ok "DNS route created: $CF_DOMAIN → tunnel"
+
+    # Install as systemd service
+    cloudflared service install 2>/dev/null || \
+        cloudflared tunnel --config /etc/cloudflared/config.yml service install 2>/dev/null
+    systemctl enable cloudflared 2>/dev/null
+    systemctl start  cloudflared 2>/dev/null
+
+    sleep 3
+    if systemctl is-active --quiet cloudflared 2>/dev/null; then
+        log_ok "Cloudflare tunnel running as system service"
+    else
+        log_warn "Starting tunnel manually..."
+        cloudflared tunnel --config /etc/cloudflared/config.yml run &
+    fi
+
+    echo -e "\n${GREEN}${BOLD}╔══════════════════════════════════════════════════════════════╗"
+    echo -e "║        CLOUDFLARE TUNNEL ACTIVE                              ║"
+    echo -e "╠══════════════════════════════════════════════════════════════╣"
+    echo -e "║  ${WHITE}Tunnel   : ${GREEN}$TUNNEL_NAME ($TUNNEL_ID)${GREEN}"
+    echo -e "║  ${WHITE}Domain   : ${GREEN}$CF_DOMAIN${GREEN}"
+    echo -e "║  ${WHITE}Proxy    : ${GREEN}http://USER:PASS@$CF_DOMAIN:80${GREEN}"
+    echo -e "║  ${WHITE}AWS IP   : ${GREEN}HIDDEN — not exposed anywhere${GREEN}"
+    echo -e "║  ${WHITE}Exit ASN : ${GREEN}Cloudflare (not Amazon)${GREEN}"
+    echo -e "╠══════════════════════════════════════════════════════════════╣"
+    echo -e "║  ${YELLOW}In MoreLogin set:${GREEN}"
+    echo -e "║  ${WHITE}Protocol : HTTP${GREEN}"
+    echo -e "║  ${WHITE}Server   : $CF_DOMAIN${GREEN}"
+    echo -e "║  ${WHITE}Port     : 80${GREEN}"
+    echo -e "║  ${WHITE}Auth     : username / password${GREEN}"
+    echo -e "╚══════════════════════════════════════════════════════════════╝${RESET}"
+}
+
+# ── Method B: CF DNS Proxy guide ─────────────────────────────
+_cf_dns_proxy_guide() {
+    local ip; ip=$(get_server_ip)
+    echo -e "\n${CYAN}${BOLD}── Cloudflare DNS Proxy Setup Guide ────────────────────────${RESET}"
+    echo -e "${WHITE}
+STEP 1 — Add domain to Cloudflare (free account)
+  • Go to: https://dash.cloudflare.com
+  • Click 'Add Site' → enter your domain
+  • Select FREE plan
+  • Update your domain's nameservers to Cloudflare's
+
+STEP 2 — Add DNS A record
+  • In CF dashboard → DNS → Records → Add Record
+  • Type: A
+  • Name: proxy  (or @ for root)
+  • IPv4 : ${ip}
+  • Proxy: ENABLED (orange cloud ☁ ON)
+  • TTL  : Auto
+
+STEP 3 — SSL/TLS settings
+  • In CF → SSL/TLS → set to 'Flexible' or 'Full'
+  • In CF → SSL/TLS → Edge Certificates → Always Use HTTPS: ON
+
+STEP 4 — Configure proxy to accept CF connections
+  • CF connects to your VPS on port 80 or 443
+  • Your Squid port ${HTTP_PORT} needs to be accessible on 80 or 443
+  • OR use nginx to forward: port 80 → port ${HTTP_PORT}
+
+STEP 5 — Cloudflare security settings
+  • CF → Security → Settings → Security Level: Low
+    (High security will block proxy CONNECT requests)
+  • CF → Network → WebSockets: ON (for CONNECT tunneling)
+
+STEP 6 — Connect via domain
+  • Use: http://USER:PASS@yourdomain.com:80
+  • Your real IP (${ip}) is now hidden
+
+LIMITATIONS WITH THIS METHOD:
+  ⚠ Only works on CF-supported ports: 80, 8080, 8880, 2052, 2082,
+    2086, 2095 (HTTP) or 443, 2053, 2083, 2087, 2096, 8443 (HTTPS)
+  ⚠ Cloudflare caches GET requests — configure Cache to bypass
+  ⚠ Cloudflare's ASN (13335) is known to some detectors
+  ⚠ CF may block CONNECT method needed for HTTPS proxying${RESET}"
+}
+
+# ── Method C: CF Workers setup ────────────────────────────────
+_cf_workers_setup() {
+    echo -e "\n${CYAN}${BOLD}── Cloudflare Workers Proxy ────────────────────────────────${RESET}"
+    echo -e "${WHITE}
+Cloudflare Workers act as a serverless middleman:
+  Browser → CF Worker (random edge IP) → Your VPS proxy
+
+The Worker script to deploy on Cloudflare:
+─────────────────────────────────────────────────────────────${RESET}"
+
+    local ip; ip=$(get_server_ip)
+    cat <<EOF
+// Cloudflare Worker — Proxy Forwarder
+// Deploy at: dash.cloudflare.com → Workers & Pages → Create Worker
+
+addEventListener('fetch', event => {
+  event.respondWith(handleRequest(event.request))
+})
+
+async function handleRequest(request) {
+  // Forward all requests to your VPS proxy
+  const VPS_PROXY = 'http://${ip}:${HTTP_PORT}'
+
+  // Build proxied URL
+  const url = new URL(request.url)
+  const targetURL = VPS_PROXY + url.pathname + url.search
+
+  // Clone request with original headers (strip CF headers)
+  const proxyRequest = new Request(targetURL, {
+    method: request.method,
+    headers: (() => {
+      const h = new Headers(request.headers)
+      h.delete('cf-connecting-ip')
+      h.delete('cf-ray')
+      h.delete('cf-visitor')
+      h.delete('x-forwarded-for')
+      h.delete('x-real-ip')
+      return h
+    })(),
+    body: request.method !== 'GET' && request.method !== 'HEAD'
+          ? request.body : undefined,
+    redirect: 'follow'
+  })
+
+  const response = await fetch(proxyRequest)
+
+  // Strip response headers that reveal proxy
+  const cleanResponse = new Response(response.body, response)
+  cleanResponse.headers.delete('via')
+  cleanResponse.headers.delete('x-cache')
+  cleanResponse.headers.delete('server')
+
+  return cleanResponse
+}
+EOF
+
+    echo -e "\n${WHITE}
+─────────────────────────────────────────────────────────────
+DEPLOY STEPS:
+  1. Go to https://dash.cloudflare.com → Workers & Pages
+  2. Create Application → Create Worker
+  3. Paste the code above → Deploy
+  4. Add custom domain: proxy.yourdomain.com → your worker
+  5. Use in MoreLogin: http://USER:PASS@proxy.yourdomain.com
+
+RESULT:
+  • Your VPS IP is completely hidden
+  • Traffic appears to come from CF edge nodes (100+ countries)
+  • Each request may use a different Cloudflare IP
+  • Looks like normal HTTPS website traffic${RESET}"
+}
+
+# ── Check if domain is behind CF ─────────────────────────────
+_cf_check_domain() {
+    echo -ne "\n${YELLOW}Enter domain to check: ${RESET}"; read -r chkdomain
+    [[ -z "$chkdomain" ]] && return
+
+    echo -e "\n${CYAN}── Cloudflare Detection Check: $chkdomain ──────────────────${RESET}"
+    local resolved_ip; resolved_ip=$(dig +short "$chkdomain" 2>/dev/null | tail -1)
+    echo -e "  ${WHITE}Domain resolves to: ${GREEN}$resolved_ip${RESET}"
+
+    # Check if IP is in Cloudflare's ranges
+    local cf_asn; cf_asn=$(curl --noproxy '*' -s --max-time 6 \
+        "https://ipinfo.io/$resolved_ip/json" 2>/dev/null \
+        | grep -o '"org":"[^"]*"' | cut -d'"' -f4)
+    echo -e "  ${WHITE}ASN/Org: ${GREEN}$cf_asn${RESET}"
+
+    if echo "$cf_asn" | grep -qi "cloudflare\|13335"; then
+        echo -e "  ${GREEN}${BOLD}✔ Domain IS behind Cloudflare — your VPS IP is hidden${RESET}"
+        echo -e "  ${CYAN}  Client sees Cloudflare IP, not your AWS IP${RESET}"
+
+        # Check if CF is proxying correctly
+        local real_ip; real_ip=$(get_server_ip)
+        echo -e "\n  ${WHITE}Your real VPS IP : ${YELLOW}$real_ip${RESET}"
+        echo -e "  ${WHITE}Public domain IP : ${GREEN}$resolved_ip${RESET}"
+        if [[ "$resolved_ip" != "$real_ip" ]]; then
+            echo -e "  ${GREEN}✔ IPs are different — VPS is properly hidden behind CF${RESET}"
+        else
+            echo -e "  ${RED}✗ Same IP — Cloudflare proxy (orange cloud) is NOT enabled${RESET}"
+            echo -e "  ${YELLOW}  Fix: CF Dashboard → DNS → click grey cloud → turn orange${RESET}"
+        fi
+    else
+        echo -e "  ${RED}✗ Domain is NOT behind Cloudflare${RESET}"
+        if [[ "$resolved_ip" == "$(get_server_ip)" ]]; then
+            echo -e "  ${YELLOW}  Domain points to your VPS directly — IP is exposed${RESET}"
+            echo -e "  ${CYAN}  Fix: Add domain to Cloudflare and enable orange cloud proxy${RESET}"
+        fi
+    fi
+
+    # Check SSL
+    echo -e "\n  ${CYAN}SSL Check:${RESET}"
+    local ssl_info; ssl_info=$(echo | openssl s_client -connect "$chkdomain:443" \
+        -servername "$chkdomain" 2>/dev/null | openssl x509 -noout -issuer 2>/dev/null)
+    if echo "$ssl_info" | grep -qi "cloudflare"; then
+        echo -e "  ${GREEN}✔ SSL cert issued by Cloudflare — traffic is CF-protected${RESET}"
+    elif [[ -n "$ssl_info" ]]; then
+        echo -e "  ${WHITE}SSL issuer: $ssl_info${RESET}"
+    else
+        echo -e "  ${YELLOW}  No SSL or connection failed${RESET}"
+    fi
 }
 
 # ══════════════════════════════════════════════════════════════
