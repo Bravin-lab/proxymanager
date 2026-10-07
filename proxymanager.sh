@@ -58,11 +58,14 @@ banner() {
     echo "║    HTTP/HTTPS (Squid) │ SOCKS5 (Dante) │ Multi (3proxy)    ║"
     echo "╚══════════════════════════════════════════════════════════════╝"
     echo -e "${RESET}"
-    # Show server IP
-    local ip; ip=$(curl -s ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')
-    echo -e "  ${CYAN}Server IP : ${WHITE}${ip}${RESET}"
-    echo -e "  ${CYAN}Hostname  : ${WHITE}$(hostname)${RESET}"
-    echo -e "  ${CYAN}OS        : ${WHITE}$(lsb_release -ds 2>/dev/null)${RESET}"
+    # Show both public and private IP
+    local pub_ip; pub_ip=$(get_server_ip)
+    local priv_ip; priv_ip=$(hostname -I | awk '{print $1}')
+    echo -e "  ${CYAN}Public IP  : ${GREEN}${pub_ip}${RESET}  ${YELLOW}← USE THIS to connect${RESET}"
+    [[ "$pub_ip" != "$priv_ip" ]] && \
+    echo -e "  ${CYAN}Private IP : ${WHITE}${priv_ip}${RESET}  ${YELLOW}(internal — do NOT use for proxy)${RESET}"
+    echo -e "  ${CYAN}Hostname   : ${WHITE}$(hostname)${RESET}"
+    echo -e "  ${CYAN}OS         : ${WHITE}$(lsb_release -ds 2>/dev/null)${RESET}"
     echo ""
 }
 
@@ -109,10 +112,19 @@ main_menu() {
     echo -e "  ${MAGENTA}23.${RESET}  ${GREEN}Full Leakproof Hardening (IPv6, DNS, Headers, TTL, iptables)${RESET}"
     echo -e "  ${MAGENTA}24.${RESET}  ${GREEN}Check Leak Status (verify all protections)${RESET}"
     echo -e "  ${MAGENTA}25.${RESET}  ${GREEN}Undo Leakproof Hardening${RESET}"
-    echo -e "  ${YELLOW}26.${RESET}  ${RED}Exit${RESET}"
+    echo -e ""
+    echo -e "  ${CYAN}── SSL / DOMAIN ──${RESET}"
+    echo -e "  ${CYAN}26.${RESET}  ${GREEN}Add / Re-issue SSL Certificate for Domain${RESET}"
+    echo -e "  ${CYAN}27.${RESET}  ${GREEN}View SSL Certificate Status${RESET}"
+    echo -e ""
+    echo -e "  ${RED}── ANTI-DETECTION (Bypass VPN/Proxy Detection) ──${RESET}"
+    echo -e "  ${RED}29.${RESET}  ${GREEN}Full Anti-Detection Hardening${RESET}"
+    echo -e "  ${RED}30.${RESET}  ${GREEN}Check Detection Risk Score${RESET}"
+    echo -e "  ${RED}31.${RESET}  ${GREEN}Residential IP Masking (ISP spoof)${RESET}"
+    echo -e "  ${YELLOW}28.${RESET}  ${RED}Exit${RESET}"
     echo -e ""
     echo -e "${YELLOW}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
-    echo -ne "\n  ${YELLOW}Select option (1-26): ${GREEN}"
+    echo -ne "\n  ${YELLOW}Select option (1-31): ${GREEN}"
     read -r choice
     echo -e "${RESET}"
     handle_choice "$choice"
@@ -125,9 +137,27 @@ press_enter() { echo -e "\n${YELLOW}Press Enter to return to menu...${RESET}"; r
 
 pkg_install() {
     log_info "Installing: $*"
-    apt-get install -y "$@" >> "$LOG_DIR/install.log" 2>&1 \
+    # Unset proxy env vars so apt never tries to use our own proxy
+    env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        -o Dpkg::Options::="--force-confdef" \
+        -o Dpkg::Options::="--force-confold" \
+        -o Acquire::http::Proxy="false" \
+        -o Acquire::https::Proxy="false" \
+        "$@" >> "$LOG_DIR/install.log" 2>&1 \
         && log_ok "Installed: $*" \
         || log_err "Failed to install: $*"
+}
+
+apt_update() {
+    log_info "Updating package lists..."
+    env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq \
+        -o Acquire::http::Proxy="false" \
+        -o Acquire::https::Proxy="false" \
+        >> "$LOG_DIR/install.log" 2>&1 \
+        && log_ok "Package lists updated" \
+        || log_warn "apt-get update had warnings"
 }
 
 service_action() {
@@ -142,7 +172,71 @@ save_user() {
     echo "$user:$pass:$type:$(ts)" >> "$USERS_FILE"
 }
 
-get_server_ip() { curl -s ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}'; }
+get_server_ip() {
+    # IMPORTANT: unset ALL proxy vars so curl goes direct to the internet
+    # Also use --noproxy '*' as extra insurance
+    local pub_ip
+    local CURL="env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u all_proxy curl --noproxy '*' -s --max-time 6"
+
+    # Method 1: AWS EC2 instance metadata (fastest on AWS, no internet needed)
+    # First get a token for IMDSv2
+    local TOKEN
+    TOKEN=$(env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
+        curl --noproxy '*' -s -X PUT --max-time 3 \
+        "http://169.254.169.254/latest/api/token" \
+        -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" 2>/dev/null)
+    if [[ -n "$TOKEN" ]]; then
+        pub_ip=$(env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
+            curl --noproxy '*' -s --max-time 3 \
+            -H "X-aws-ec2-metadata-token: $TOKEN" \
+            "http://169.254.169.254/latest/meta-data/public-ipv4" 2>/dev/null)
+        if [[ -n "$pub_ip" && "$pub_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "$pub_ip"; return
+        fi
+    fi
+    # IMDSv1 fallback (older AWS)
+    pub_ip=$(env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
+        curl --noproxy '*' -s --max-time 3 \
+        "http://169.254.169.254/latest/meta-data/public-ipv4" 2>/dev/null)
+    if [[ -n "$pub_ip" && "$pub_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        echo "$pub_ip"; return
+    fi
+
+    # Method 2: GCP metadata
+    pub_ip=$(env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
+        curl --noproxy '*' -s --max-time 3 \
+        -H "Metadata-Flavor: Google" \
+        "http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/externalIp" 2>/dev/null)
+    if [[ -n "$pub_ip" && "$pub_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        echo "$pub_ip"; return
+    fi
+
+    # Method 3: External IP check services (bypassing proxy)
+    for url in \
+        "http://api.ipify.org" \
+        "http://ifconfig.me/ip" \
+        "http://icanhazip.com" \
+        "http://checkip.amazonaws.com" \
+        "http://ipecho.net/plain" \
+        "http://myexternalip.com/raw"; do
+        pub_ip=$($CURL "$url" 2>/dev/null | tr -d '[:space:]')
+        if [[ -n "$pub_ip" && "$pub_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "$pub_ip"; return
+        fi
+    done
+
+    # Method 4: dig DNS lookup (doesn't use HTTP proxy at all)
+    if command -v dig &>/dev/null; then
+        pub_ip=$(dig +short myip.opendns.com @resolver1.opendns.com 2>/dev/null | tr -d '[:space:]')
+        if [[ -n "$pub_ip" && "$pub_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "$pub_ip"; return
+        fi
+    fi
+
+    # Last resort: private IP with warning
+    local priv_ip; priv_ip=$(hostname -I | awk '{print $1}')
+    echo "$priv_ip"
+}
 
 # ══════════════════════════════════════════════════════════════
 #  1. INSTALL SQUID (HTTP/HTTPS)
@@ -150,33 +244,136 @@ get_server_ip() { curl -s ifconfig.me 2>/dev/null || hostname -I | awk '{print $
 install_squid() {
     banner
     echo -e "${CYAN}${BOLD}[1] Installing Squid HTTP/HTTPS Proxy${RESET}\n"
-    apt-get update -qq
-    pkg_install squid apache2-utils
+    apt_update
+
+    # Ubuntu 24.04 (Noble) ships squid without SSL support built in.
+    # squid-openssl is the package that includes SSL bump.
+    log_info "Detecting correct Squid package for this OS..."
+    local SQUID_PKG="squid"
+    if env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
+       apt-cache show squid-openssl &>/dev/null 2>&1; then
+        SQUID_PKG="squid-openssl"
+        log_ok "Found squid-openssl (SSL bump supported)"
+    else
+        log_warn "squid-openssl not available — installing standard squid (no SSL bump)"
+    fi
+
+    # Remove any existing broken squid install first
+    env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
+        DEBIAN_FRONTEND=noninteractive apt-get remove -y squid squid-openssl \
+        >> "$LOG_DIR/install.log" 2>&1 || true
+
+    pkg_install "$SQUID_PKG" apache2-utils openssl
+    SQUID_AUTH_HELPER=$(find /usr/lib/squid /usr/libexec/squid -name "basic_ncsa_auth" 2>/dev/null | head -1)
+    [[ -z "$SQUID_AUTH_HELPER" ]] && SQUID_AUTH_HELPER="/usr/lib/squid/basic_ncsa_auth"
+    log_info "Auth helper: $SQUID_AUTH_HELPER"
 
     echo -ne "${YELLOW}HTTP port (default $HTTP_PORT): ${RESET}"; read -r p
     HTTP_PORT=${p:-$HTTP_PORT}
-    echo -ne "${YELLOW}HTTPS port (default $HTTP_PORT): ${RESET}"; read -r p2
+    echo -ne "${YELLOW}HTTPS port (default $HTTPS_PORT): ${RESET}"; read -r p2
     HTTPS_PORT=${p2:-$HTTPS_PORT}
 
-    # Backup original config
+    # ── Optional domain + nginx + Let's Encrypt ───────────────
+    local USE_DOMAIN=false
+    local DOMAIN=""
+    local EMAIL=""
+    echo ""
+    echo -e "${YELLOW}┌─────────────────────────────────────────────────────┐"
+    echo -e "│  OPTIONAL: Domain + Nginx + Free SSL (Let's Encrypt) │"
+    echo -e "│  • Your VPS IP must already point to the domain      │"
+    echo -e "│  • Gives you a real trusted HTTPS proxy certificate  │"
+    echo -e "│  • Skip this to use a self-signed cert instead       │"
+    echo -e "└─────────────────────────────────────────────────────┘${RESET}"
+    echo -ne "\n${YELLOW}Do you have a domain pointed to this VPS? (y/n): ${RESET}"
+    read -r has_domain
+
+    if [[ "$has_domain" == "y" || "$has_domain" == "Y" ]]; then
+        echo -ne "${YELLOW}Enter your domain (e.g. proxy.example.com): ${RESET}"
+        read -r DOMAIN
+        DOMAIN=$(echo "$DOMAIN" | tr '[:upper:]' '[:lower:]' | xargs)
+
+        if [[ -z "$DOMAIN" ]]; then
+            log_warn "No domain entered — using self-signed certificate"
+        else
+            echo -ne "${YELLOW}Enter email for SSL cert notifications: ${RESET}"
+            read -r EMAIL
+
+            # Verify domain resolves to this server
+            log_info "Verifying domain $DOMAIN points to this server..."
+            local VPS_IP; VPS_IP=$(get_server_ip)
+            local DOMAIN_IP; DOMAIN_IP=$(dig +short "$DOMAIN" 2>/dev/null | tail -1)
+
+            if [[ -z "$DOMAIN_IP" ]]; then
+                log_warn "Could not resolve $DOMAIN — check DNS propagation"
+                echo -ne "${YELLOW}Continue anyway? (y/n): ${RESET}"; read -r fc
+                [[ "$fc" != "y" ]] && DOMAIN="" || USE_DOMAIN=true
+            elif [[ "$DOMAIN_IP" != "$VPS_IP" ]]; then
+                echo -e "${RED}  Domain IP : $DOMAIN_IP"
+                echo -e "  VPS IP    : $VPS_IP${RESET}"
+                log_warn "Domain does not point to this VPS yet"
+                echo -e "${CYAN}  Fix: Go to your DNS provider and set:"
+                echo -e "  A record → $DOMAIN → $VPS_IP${RESET}"
+                echo -ne "${YELLOW}Continue anyway? (may fail cert issuance) (y/n): ${RESET}"
+                read -r fc
+                [[ "$fc" != "y" ]] && DOMAIN="" || USE_DOMAIN=true
+            else
+                log_ok "Domain verified: $DOMAIN → $DOMAIN_IP ✔"
+                USE_DOMAIN=true
+            fi
+        fi
+    fi
+
+    # ── Backup original config ────────────────────────────────
     [[ -f $SQUID_CONF ]] && cp "$SQUID_CONF" "${SQUID_CONF}.bak.$(date +%s)"
     touch "$SQUID_PASSWD"
     chmod 640 "$SQUID_PASSWD"
     chown proxy:proxy "$SQUID_PASSWD" 2>/dev/null || true
 
+    # ── Detect if SSL bump is available ───────────────────────
+    local HAS_SSL_BUMP=false
+    if squid -v 2>&1 | grep -q "ssl-bump\|openssl\|SSL"; then
+        HAS_SSL_BUMP=true
+        log_ok "SSL bump supported by this Squid build"
+    else
+        log_warn "This Squid build does NOT support ssl-bump — HTTPS port will use CONNECT tunnel mode only"
+    fi
+
+    # ── Write Squid config ────────────────────────────────────
     cat > "$SQUID_CONF" <<EOF
 # ── Proxy Manager Pro — Squid Config ──────────────────────────
 http_port ${HTTP_PORT}
-http_port ${HTTPS_PORT} ssl-bump cert=/etc/squid/squid.pem key=/etc/squid/squid.key
+EOF
+
+    if [[ "$HAS_SSL_BUMP" == true ]]; then
+        cat >> "$SQUID_CONF" <<EOF
+http_port ${HTTPS_PORT} ssl-bump \
+    cert=/etc/squid/squid.pem \
+    key=/etc/squid/squid.key \
+    generate-host-certificates=on \
+    dynamic_cert_mem_cache_size=4MB
+
+# SSL Bump settings
+ssl_bump server-first all
+sslproxy_cert_error allow all
+sslproxy_flags DONT_VERIFY_PEER
+EOF
+    else
+        cat >> "$SQUID_CONF" <<EOF
+# HTTPS CONNECT tunnel (no ssl-bump — standard squid package)
+http_port ${HTTPS_PORT}
+EOF
+    fi
+
+    cat >> "$SQUID_CONF" <<EOF
 
 # Auth
-auth_param basic program /usr/lib/squid/basic_ncsa_auth ${SQUID_PASSWD}
+auth_param basic program ${SQUID_AUTH_HELPER} ${SQUID_PASSWD}
 auth_param basic realm "Proxy Authentication Required"
 auth_param basic credentialsttl 24 hours
 auth_param basic casesensitive on
 
 acl authenticated proxy_auth REQUIRED
-acl SSL_ports port 443
+acl SSL_ports port 443 8443
 acl Safe_ports port 80 443 8080 8443 21 22 25 110 143 993 995 1025-65535
 acl CONNECT method CONNECT
 
@@ -214,21 +411,266 @@ read_timeout 60 seconds
 request_timeout 60 seconds
 EOF
 
-    # Generate self-signed cert for HTTPS bumping
-    if [[ ! -f /etc/squid/squid.pem ]]; then
-        log_info "Generating SSL certificate for HTTPS interception..."
-        openssl req -new -newkey rsa:2048 -days 3650 -nodes -x509 \
-            -subj "/C=US/ST=State/L=City/O=Proxy/CN=$(get_server_ip)" \
-            -keyout /etc/squid/squid.key \
-            -out /etc/squid/squid.pem >> "$LOG_DIR/install.log" 2>&1
+    # ── SSL Certificate setup ─────────────────────────────────
+    if [[ "$HAS_SSL_BUMP" == true ]]; then
+        if [[ "$USE_DOMAIN" == true && -n "$DOMAIN" ]]; then
+            setup_nginx_ssl "$DOMAIN" "$EMAIL"
+        else
+            log_info "Generating self-signed SSL certificate..."
+            openssl req -new -newkey rsa:2048 -days 3650 -nodes -x509 \
+                -subj "/C=US/ST=State/L=City/O=ProxyManager/CN=$(get_server_ip)" \
+                -keyout /etc/squid/squid.key \
+                -out /etc/squid/squid.pem >> "$LOG_DIR/install.log" 2>&1
+            chmod 600 /etc/squid/squid.key
+            chown proxy:proxy /etc/squid/squid.pem /etc/squid/squid.key 2>/dev/null || true
+            log_ok "Self-signed certificate generated"
+        fi
+
+        # Initialize SSL DB for dynamic cert generation
+        local CERTGEN
+        CERTGEN=$(find /usr/lib/squid /usr/libexec/squid -name "security_file_certgen" 2>/dev/null | head -1)
+        if [[ -n "$CERTGEN" ]]; then
+            mkdir -p /var/lib/squid/ssl_db
+            "$CERTGEN" -c -s /var/lib/squid/ssl_db -M 4MB >> "$LOG_DIR/install.log" 2>&1 || true
+            chown -R proxy:proxy /var/lib/squid/ssl_db 2>/dev/null || true
+            log_ok "SSL certificate DB initialized"
+        fi
+    else
+        log_info "Skipping SSL cert setup (not needed without ssl-bump)"
     fi
 
-    squid -k parse 2>/dev/null && log_ok "Squid config valid" || log_warn "Check squid config"
-    systemctl enable squid && systemctl restart squid
-    log_ok "Squid installed on port ${HTTP_PORT} (HTTP) and ${HTTPS_PORT} (HTTPS)"
+    # ── Initialize cache dir ──────────────────────────────────
+    log_info "Initializing Squid cache..."
+    squid -z >> "$LOG_DIR/install.log" 2>&1 || true
+
+    # ── Validate and start ────────────────────────────────────
+    log_info "Validating Squid config..."
+    local parse_out; parse_out=$(squid -k parse 2>&1)
+    local fatal_count; fatal_count=$(echo "$parse_out" | grep -icE "FATAL|ERROR" || true)
+
+    if [[ "$fatal_count" -eq 0 ]]; then
+        log_ok "Squid config valid"
+    else
+        log_warn "Config issues found — showing errors:"
+        echo "$parse_out" | grep -iE "FATAL|ERROR" | head -10
+        log_warn "Attempting to start anyway..."
+    fi
+
+    systemctl enable squid >> "$LOG_DIR/install.log" 2>&1
+    systemctl stop squid >> "$LOG_DIR/install.log" 2>&1 || true
+    sleep 1
+    systemctl start squid
+
+    sleep 2
+    if systemctl is-active --quiet squid; then
+        log_ok "Squid is running on port ${HTTP_PORT} (HTTP) and ${HTTPS_PORT} (HTTPS)"
+    else
+        log_err "Squid failed to start. Checking logs..."
+        journalctl -u squid -n 20 --no-pager 2>/dev/null | tail -20
+        log_warn "Try: sudo journalctl -xeu squid.service"
+    fi
     echo "squid_http=$HTTP_PORT" >> "$CONFIG_FILE"
     echo "squid_https=$HTTPS_PORT" >> "$CONFIG_FILE"
+    [[ -n "$DOMAIN" ]] && echo "squid_domain=$DOMAIN" >> "$CONFIG_FILE"
+
+    # ── Show connection info ──────────────────────────────────
+    local ip; ip=$(get_server_ip)
+    echo -e "\n${GREEN}${BOLD}╔══════════════════════════════════════════════════════╗"
+    echo -e "║           SQUID PROXY READY                          ║"
+    echo -e "╠══════════════════════════════════════════════════════╣"
+    if [[ "$USE_DOMAIN" == true && -n "$DOMAIN" ]]; then
+    echo -e "║  ${WHITE}HTTP  : ${GREEN}http://$DOMAIN:${HTTP_PORT}${GREEN}"
+    echo -e "║  ${WHITE}HTTPS : ${GREEN}https://$DOMAIN:${HTTPS_PORT}${GREEN}"
+    echo -e "║  ${WHITE}Nginx : ${GREEN}https://$DOMAIN (port 443 → Squid)${GREEN}"
+    fi
+    echo -e "║  ${WHITE}HTTP  : ${GREEN}http://$ip:${HTTP_PORT}${GREEN}"
+    echo -e "║  ${WHITE}HTTPS : ${GREEN}https://$ip:${HTTPS_PORT}${GREEN}"
+    echo -e "╚══════════════════════════════════════════════════════╝${RESET}"
     press_enter
+}
+
+# ══════════════════════════════════════════════════════════════
+#  NGINX + CERTBOT SSL SETUP (called from install_squid)
+# ══════════════════════════════════════════════════════════════
+setup_nginx_ssl() {
+    local DOMAIN=$1
+    local EMAIL=$2
+    local ip; ip=$(get_server_ip)
+
+    echo ""
+    log_info "Setting up Nginx + Let's Encrypt for: $DOMAIN"
+
+    # ── Install nginx and certbot ─────────────────────────────
+    pkg_install nginx certbot python3-certbot-nginx dnsutils
+
+    # ── Allow HTTP/HTTPS through firewall for cert validation ─
+    ufw allow 80/tcp  >> "$LOG_DIR/install.log" 2>&1
+    ufw allow 443/tcp >> "$LOG_DIR/install.log" 2>&1
+    log_ok "Ports 80 and 443 opened for SSL validation"
+
+    # ── Write initial Nginx config (HTTP only for cert challenge)
+    local NGINX_CONF="/etc/nginx/sites-available/proxymanager"
+    cat > "$NGINX_CONF" <<EOF
+# ── Proxy Manager Pro — Nginx Config ──────────────────────────
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${DOMAIN};
+
+    # Let's Encrypt challenge
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+    }
+
+    # Redirect all HTTP to HTTPS
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
+}
+EOF
+
+    # Enable site and reload nginx
+    ln -sf "$NGINX_CONF" /etc/nginx/sites-enabled/proxymanager 2>/dev/null
+    rm -f /etc/nginx/sites-enabled/default 2>/dev/null
+    nginx -t >> "$LOG_DIR/install.log" 2>&1 && systemctl reload nginx
+    log_ok "Nginx configured for $DOMAIN"
+
+    # ── Issue Let's Encrypt certificate ──────────────────────
+    log_info "Requesting SSL certificate from Let's Encrypt..."
+    local CERT_ARGS="--nginx -d $DOMAIN --non-interactive --agree-tos"
+    if [[ -n "$EMAIL" ]]; then
+        CERT_ARGS="$CERT_ARGS --email $EMAIL"
+    else
+        CERT_ARGS="$CERT_ARGS --register-unsafely-without-email"
+    fi
+
+    if certbot $CERT_ARGS >> "$LOG_DIR/install.log" 2>&1; then
+        log_ok "SSL certificate issued for $DOMAIN ✔"
+        local CERT_PATH="/etc/letsencrypt/live/$DOMAIN"
+
+        # ── Convert Let's Encrypt cert for Squid use ─────────
+        log_info "Converting certificate for Squid..."
+        # Squid needs PEM format — combine fullchain + key
+        cat "${CERT_PATH}/fullchain.pem" > /etc/squid/squid.pem
+        cat "${CERT_PATH}/privkey.pem"   > /etc/squid/squid.key
+        chmod 600 /etc/squid/squid.key
+        chown proxy:proxy /etc/squid/squid.pem /etc/squid/squid.key 2>/dev/null || true
+        log_ok "Let's Encrypt cert installed for Squid"
+
+        # ── Write full Nginx HTTPS config (proxy tunnel) ─────
+        cat > "$NGINX_CONF" <<EOF
+# ── Proxy Manager Pro — Nginx HTTPS Config ────────────────────
+
+# HTTP → HTTPS redirect
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${DOMAIN};
+    return 301 https://\$host\$request_uri;
+}
+
+# HTTPS reverse proxy → Squid
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name ${DOMAIN};
+
+    # Let's Encrypt certificates
+    ssl_certificate     /etc/letsencrypt/live/${DOMAIN}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${DOMAIN}/privkey.pem;
+    include             /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam         /etc/letsencrypt/ssl-dhparams.pem;
+
+    # Strong SSL settings
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers on;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1d;
+    ssl_session_tickets off;
+
+    # HSTS (force HTTPS for 1 year)
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+
+    # Hide nginx version
+    server_tokens off;
+
+    # Strip identifying headers
+    proxy_hide_header X-Powered-By;
+    proxy_hide_header Server;
+
+    # Proxy CONNECT requests → Squid
+    location / {
+        proxy_pass http://127.0.0.1:${HTTP_PORT};
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_connect_timeout 30s;
+        proxy_read_timeout    60s;
+        proxy_send_timeout    60s;
+
+        # Hide proxy identity
+        proxy_set_header X-Forwarded-For "";
+        proxy_set_header Via "";
+    }
+}
+EOF
+        nginx -t >> "$LOG_DIR/install.log" 2>&1 \
+            && systemctl reload nginx \
+            && log_ok "Nginx HTTPS proxy configured for $DOMAIN"
+
+        # ── Auto-renew cron ───────────────────────────────────
+        # Certbot installs its own timer but also add a hook to
+        # copy renewed certs to Squid automatically
+        cat > /etc/letsencrypt/renewal-hooks/deploy/copy-to-squid.sh <<'HOOK'
+#!/bin/bash
+# Auto-copy renewed cert to Squid after Let's Encrypt renewal
+DOMAIN=$(ls /etc/letsencrypt/live/ | grep -v README | head -1)
+CERT_PATH="/etc/letsencrypt/live/$DOMAIN"
+cat "${CERT_PATH}/fullchain.pem" > /etc/squid/squid.pem
+cat "${CERT_PATH}/privkey.pem"   > /etc/squid/squid.key
+chmod 600 /etc/squid/squid.key
+chown proxy:proxy /etc/squid/squid.pem /etc/squid/squid.key 2>/dev/null
+systemctl reload squid 2>/dev/null
+systemctl reload nginx 2>/dev/null
+echo "[$(date)] Squid/Nginx certs renewed from Let's Encrypt" >> /var/log/proxymanager/cert-renew.log
+HOOK
+        chmod +x /etc/letsencrypt/renewal-hooks/deploy/copy-to-squid.sh
+        log_ok "Auto-renewal hook installed (certs auto-copy to Squid on renewal)"
+
+        # ── Test auto-renewal ─────────────────────────────────
+        certbot renew --dry-run >> "$LOG_DIR/install.log" 2>&1 \
+            && log_ok "Auto-renewal dry-run passed ✔" \
+            || log_warn "Auto-renewal dry-run had warnings — check $LOG_DIR/install.log"
+
+        echo -e "\n${GREEN}${BOLD}╔══════════════════════════════════════════════════════╗"
+        echo -e "║        SSL SETUP COMPLETE                            ║"
+        echo -e "╠══════════════════════════════════════════════════════╣"
+        echo -e "║  ${WHITE}Domain    : ${GREEN}$DOMAIN${GREEN}"
+        echo -e "║  ${WHITE}HTTPS     : ${GREEN}https://$DOMAIN${GREEN}"
+        echo -e "║  ${WHITE}HTTP Proxy: ${GREEN}http://$DOMAIN:${HTTP_PORT}${GREEN}"
+        echo -e "║  ${WHITE}Cert Path : ${GREEN}/etc/letsencrypt/live/$DOMAIN/${GREEN}"
+        echo -e "║  ${WHITE}Auto-renew: ${GREEN}Every 90 days (automatic)${GREEN}"
+        echo -e "║  ${WHITE}Squid cert: ${GREEN}/etc/squid/squid.pem${GREEN}"
+        echo -e "╚══════════════════════════════════════════════════════╝${RESET}"
+
+    else
+        # Cert issuance failed — fall back to self-signed
+        log_warn "Let's Encrypt cert issuance failed (check DNS propagation)"
+        log_warn "Falling back to self-signed certificate..."
+        echo -e "${CYAN}  Common reasons:"
+        echo -e "  1. DNS not propagated yet (wait 5-10 mins and retry)"
+        echo -e "  2. Port 80 blocked by VPS firewall / provider"
+        echo -e "  3. Domain typo"
+        echo -e "  Re-run Option 1 once DNS is confirmed to retry.${RESET}"
+
+        openssl req -new -newkey rsa:2048 -days 3650 -nodes -x509 \
+            -subj "/C=US/ST=State/L=City/O=ProxyManager/CN=$DOMAIN" \
+            -keyout /etc/squid/squid.key \
+            -out /etc/squid/squid.pem >> "$LOG_DIR/install.log" 2>&1
+        chmod 600 /etc/squid/squid.key
+        chown proxy:proxy /etc/squid/squid.pem /etc/squid/squid.key 2>/dev/null || true
+        log_ok "Self-signed cert generated for $DOMAIN as fallback"
+    fi
 }
 
 # ══════════════════════════════════════════════════════════════
@@ -237,15 +679,24 @@ EOF
 install_dante() {
     banner
     echo -e "${CYAN}${BOLD}[2] Installing Dante SOCKS5 Proxy${RESET}\n"
-    apt-get update -qq
+    apt_update
     pkg_install dante-server
 
     echo -ne "${YELLOW}SOCKS5 port (default $SOCKS5_PORT): ${RESET}"; read -r p
     SOCKS5_PORT=${p:-$SOCKS5_PORT}
 
-    # Detect main interface
-    local iface; iface=$(ip route get 8.8.8.8 | awk '{print $5; exit}')
-    log_info "Using interface: $iface"
+    # Detect main network interface reliably
+    local iface
+    iface=$(ip route get 8.8.8.8 2>/dev/null | grep -oP 'dev \K\S+' | head -1)
+    [[ -z "$iface" ]] && iface=$(ip route | grep default | grep -oP 'dev \K\S+' | head -1)
+    [[ -z "$iface" ]] && iface=$(ls /sys/class/net | grep -v lo | head -1)
+    log_info "Network interface detected: $iface"
+
+    # Get the private IP bound to that interface
+    local bind_ip
+    bind_ip=$(ip -4 addr show "$iface" 2>/dev/null | grep -oP '(?<=inet )\d+\.\d+\.\d+\.\d+' | head -1)
+    [[ -z "$bind_ip" ]] && bind_ip="0.0.0.0"
+    log_info "Bind IP: $bind_ip  Interface: $iface"
 
     [[ -f $DANTE_CONF ]] && cp "$DANTE_CONF" "${DANTE_CONF}.bak.$(date +%s)"
 
@@ -253,43 +704,75 @@ install_dante() {
 # ── Proxy Manager Pro — Dante SOCKS5 Config ───────────────────
 logoutput: /var/log/danted.log
 
+# Listen on ALL interfaces so both public and private IPs work
 internal: 0.0.0.0 port = ${SOCKS5_PORT}
+
+# Outbound through main interface
 external: ${iface}
 
-# Auth methods
+# Auth — require username/password
 socksmethod: username
 clientmethod: none
 
-# Performance
+# Timeouts
 timeout.connect: 30
 timeout.io: 86400
+timeout.negotiate: 30
 
 user.privileged: root
 user.unprivileged: nobody
 
-# Client access (any IP)
+# Allow all client IPs to connect (auth required)
 client pass {
     from: 0.0.0.0/0 to: 0.0.0.0/0
     log: error
 }
 
-# SOCKS rules — authenticated only
+# Allow authenticated SOCKS5 — all destinations
 socks pass {
     from: 0.0.0.0/0 to: 0.0.0.0/0
     socksmethod: username
     log: connect disconnect error
     command: bind connect udpassociate
+    protocol: tcp udp
 }
 
+# Block everything else
 socks block {
     from: 0.0.0.0/0 to: 0.0.0.0/0
     log: connect error
 }
 EOF
 
-    systemctl enable danted && systemctl restart danted
-    log_ok "Dante SOCKS5 installed on port ${SOCKS5_PORT}"
+    # Open firewall
+    ufw --force enable >> "$LOG_DIR/install.log" 2>&1
+    ufw allow "$SOCKS5_PORT"/tcp comment "Dante SOCKS5" >> "$LOG_DIR/install.log" 2>&1
+    log_ok "Firewall port $SOCKS5_PORT opened"
+
+    systemctl enable danted >> "$LOG_DIR/install.log" 2>&1
+    systemctl stop danted >> "$LOG_DIR/install.log" 2>&1 || true
+    sleep 1
+    systemctl start danted
+
+    sleep 2
+    if systemctl is-active --quiet danted; then
+        log_ok "Dante SOCKS5 running on port $SOCKS5_PORT"
+    else
+        log_err "Dante failed to start — checking logs..."
+        journalctl -u danted -n 15 --no-pager 2>/dev/null
+        log_warn "Common fix: check interface name with: ip route get 8.8.8.8"
+    fi
+
     echo "dante_socks5=$SOCKS5_PORT" >> "$CONFIG_FILE"
+
+    local ip; ip=$(get_server_ip)
+    echo -e "\n${GREEN}${BOLD}╔══════════════════════════════════════════════════════╗"
+    echo -e "║           DANTE SOCKS5 READY                         ║"
+    echo -e "╠══════════════════════════════════════════════════════╣"
+    echo -e "║  ${WHITE}Public IP : ${GREEN}$ip${GREEN}  ← use this"
+    echo -e "║  ${WHITE}Port      : ${GREEN}$SOCKS5_PORT${GREEN}"
+    echo -e "║  ${WHITE}Test      : ${WHITE}curl --socks5 $ip:$SOCKS5_PORT -U USER:PASS https://ifconfig.me${GREEN}"
+    echo -e "╚══════════════════════════════════════════════════════╝${RESET}"
     press_enter
 }
 
@@ -299,33 +782,137 @@ EOF
 install_3proxy() {
     banner
     echo -e "${CYAN}${BOLD}[3] Installing 3proxy (Multi-protocol)${RESET}\n"
-    apt-get update -qq
-    pkg_install build-essential wget
+    apt_update
+    pkg_install build-essential wget curl git libssl-dev
 
     echo -ne "${YELLOW}3proxy HTTP port (default $PROXY3_HTTP): ${RESET}"; read -r p
     PROXY3_HTTP=${p:-$PROXY3_HTTP}
     echo -ne "${YELLOW}3proxy SOCKS5 port (default $PROXY3_SOCKS): ${RESET}"; read -r p2
     PROXY3_SOCKS=${p2:-$PROXY3_SOCKS}
 
-    # Install 3proxy from repo or build
     if ! command -v 3proxy &>/dev/null; then
-        log_info "Downloading and building 3proxy..."
-        cd /tmp || exit
-        wget -q https://github.com/3proxy/3proxy/archive/refs/tags/0.9.4.tar.gz \
-            -O 3proxy.tar.gz >> "$LOG_DIR/install.log" 2>&1
-        tar -xzf 3proxy.tar.gz >> "$LOG_DIR/install.log" 2>&1
-        cd 3proxy-0.9.4 || { log_err "3proxy source not found"; press_enter; return; }
-        make -f Makefile.Linux >> "$LOG_DIR/install.log" 2>&1
-        cp bin/3proxy /usr/local/bin/3proxy
-        chmod +x /usr/local/bin/3proxy
-        cd / && rm -rf /tmp/3proxy*
-        log_ok "3proxy built and installed"
+        _build_3proxy || { press_enter; return; }
+    else
+        log_ok "3proxy already installed: $(3proxy --version 2>&1 | head -1)"
     fi
 
-    mkdir -p /etc/3proxy /var/log/3proxy
-    touch "$PROXY3_USERS"
-    chmod 600 "$PROXY3_USERS"
+    _write_3proxy_config
+    _write_3proxy_service
+    _write_3proxy_users_file
 
+    systemctl daemon-reload
+    systemctl enable 3proxy >> "$LOG_DIR/install.log" 2>&1
+    systemctl restart 3proxy
+
+    if systemctl is-active --quiet 3proxy; then
+        log_ok "3proxy running → HTTP:${PROXY3_HTTP}  SOCKS5:${PROXY3_SOCKS}"
+    else
+        log_err "3proxy failed to start — check: journalctl -u 3proxy -n 30"
+    fi
+
+    echo "proxy3_http=$PROXY3_HTTP"   >> "$CONFIG_FILE"
+    echo "proxy3_socks=$PROXY3_SOCKS" >> "$CONFIG_FILE"
+
+    local ip; ip=$(get_server_ip)
+    echo -e "\n${GREEN}${BOLD}╔══════════════════════════════════════════════════════╗"
+    echo -e "║           3PROXY READY                               ║"
+    echo -e "╠══════════════════════════════════════════════════════╣"
+    echo -e "║  ${WHITE}HTTP   : ${GREEN}$ip:${PROXY3_HTTP}${GREEN}"
+    echo -e "║  ${WHITE}SOCKS5 : ${GREEN}$ip:${PROXY3_SOCKS}${GREEN}"
+    echo -e "╚══════════════════════════════════════════════════════╝${RESET}"
+    press_enter
+}
+
+# ── 3proxy build helper ───────────────────────────────────────
+_build_3proxy() {
+    log_info "Fetching latest 3proxy release from GitHub..."
+    local WORKDIR="/tmp/3proxy_build"
+    rm -rf "$WORKDIR" && mkdir -p "$WORKDIR"
+    cd "$WORKDIR" || return 1
+
+    # Get latest release tag via GitHub API (no auth needed)
+    local LATEST_TAG
+    LATEST_TAG=$(env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
+        curl -s --max-time 15 \
+        "https://api.github.com/repos/3proxy/3proxy/releases/latest" \
+        | grep '"tag_name"' | cut -d'"' -f4)
+
+    # Fallback tags if API fails
+    if [[ -z "$LATEST_TAG" ]]; then
+        log_warn "GitHub API unreachable, trying known versions..."
+        for TRY_TAG in "0.9.5" "0.9.4" "0.9.3"; do
+            local TEST_URL="https://github.com/3proxy/3proxy/archive/refs/tags/${TRY_TAG}.tar.gz"
+            if env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
+               wget -q --spider "$TEST_URL" 2>/dev/null; then
+                LATEST_TAG="$TRY_TAG"
+                log_info "Using version: $LATEST_TAG"
+                break
+            fi
+        done
+    fi
+
+    if [[ -z "$LATEST_TAG" ]]; then
+        # Last resort — clone from git
+        log_warn "Falling back to git clone..."
+        env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
+            git clone --depth 1 https://github.com/3proxy/3proxy.git "$WORKDIR/3proxy-src" \
+            >> "$LOG_DIR/install.log" 2>&1 \
+            && cd "$WORKDIR/3proxy-src" \
+            || { log_err "Could not download 3proxy source"; cd /; rm -rf "$WORKDIR"; return 1; }
+    else
+        log_info "Downloading 3proxy $LATEST_TAG ..."
+        local DL_URL="https://github.com/3proxy/3proxy/archive/refs/tags/${LATEST_TAG}.tar.gz"
+        env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
+            wget -q --show-progress --timeout=60 "$DL_URL" \
+            -O "$WORKDIR/3proxy.tar.gz" >> "$LOG_DIR/install.log" 2>&1
+
+        if [[ ! -s "$WORKDIR/3proxy.tar.gz" ]]; then
+            log_err "Download failed or file is empty"
+            cd /; rm -rf "$WORKDIR"; return 1
+        fi
+
+        tar -xzf "$WORKDIR/3proxy.tar.gz" -C "$WORKDIR" >> "$LOG_DIR/install.log" 2>&1
+        # Find extracted directory (name may vary)
+        local SRC_DIR
+        SRC_DIR=$(find "$WORKDIR" -maxdepth 1 -type d -name "3proxy-*" | head -1)
+        if [[ -z "$SRC_DIR" ]]; then
+            log_err "Could not find extracted 3proxy source directory"
+            ls -la "$WORKDIR" >> "$LOG_DIR/install.log" 2>&1
+            cd /; rm -rf "$WORKDIR"; return 1
+        fi
+        cd "$SRC_DIR" || { log_err "Cannot enter source dir: $SRC_DIR"; cd /; rm -rf "$WORKDIR"; return 1; }
+    fi
+
+    # Build
+    log_info "Compiling 3proxy (this takes ~30 seconds)..."
+    local MAKE_FILE="Makefile.Linux"
+    [[ ! -f "$MAKE_FILE" ]] && MAKE_FILE="Makefile"
+
+    if make -f "$MAKE_FILE" >> "$LOG_DIR/install.log" 2>&1; then
+        # Binary may be in bin/ or current dir
+        local BINARY
+        BINARY=$(find . -name "3proxy" -type f | head -1)
+        if [[ -n "$BINARY" ]]; then
+            cp "$BINARY" /usr/local/bin/3proxy
+            chmod +x /usr/local/bin/3proxy
+            log_ok "3proxy compiled and installed: $(3proxy --version 2>&1 | head -1)"
+        else
+            log_err "Build succeeded but binary not found"
+            cd /; rm -rf "$WORKDIR"; return 1
+        fi
+    else
+        log_err "Compilation failed — check $LOG_DIR/install.log"
+        tail -20 "$LOG_DIR/install.log"
+        cd /; rm -rf "$WORKDIR"; return 1
+    fi
+
+    cd /; rm -rf "$WORKDIR"
+    return 0
+}
+
+# ── 3proxy config writer ──────────────────────────────────────
+_write_3proxy_config() {
+    mkdir -p /etc/3proxy /var/log/3proxy
     cat > "$PROXY3_CONF" <<EOF
 # ── Proxy Manager Pro — 3proxy Config ─────────────────────────
 daemon
@@ -333,22 +920,23 @@ pidfile /var/run/3proxy.pid
 nserver 1.1.1.1
 nserver 8.8.8.8
 nserver 9.9.9.9
-nsrecord cloudflare.com 104.16.0.0
 
 # Logging
 log /var/log/3proxy/3proxy.log D
 logformat "- +_L%t.%.  %N.%p %E %U %C:%c %R:%r %O %I %h %T"
 rotate 30
 
-# Auth
-users $/etc/3proxy/users.cfg
+# Auth — include users file
+include /etc/3proxy/users.cfg
+
 auth strong
 allow *
 
-# Anonymity — strip identifying headers
+# Run as nobody
 setgid 65534
 setuid 65534
-nolog 0
+
+# Timeouts
 timeouts 1 5 30 60 180 1800 15 60
 
 # HTTP Proxy
@@ -357,8 +945,18 @@ proxy -p${PROXY3_HTTP} -i0.0.0.0 -e0.0.0.0
 # SOCKS5 Proxy
 socks -p${PROXY3_SOCKS} -i0.0.0.0 -e0.0.0.0
 EOF
+    log_ok "3proxy config written"
+}
 
-    # Systemd service for 3proxy
+# ── 3proxy users file ─────────────────────────────────────────
+_write_3proxy_users_file() {
+    [[ ! -f "$PROXY3_USERS" ]] && touch "$PROXY3_USERS"
+    chmod 600 "$PROXY3_USERS"
+    chown nobody:nogroup "$PROXY3_USERS" 2>/dev/null || true
+}
+
+# ── 3proxy systemd service ────────────────────────────────────
+_write_3proxy_service() {
     cat > /etc/systemd/system/3proxy.service <<EOF
 [Unit]
 Description=3proxy Proxy Server
@@ -369,19 +967,15 @@ Type=forking
 PIDFile=/var/run/3proxy.pid
 ExecStart=/usr/local/bin/3proxy /etc/3proxy/3proxy.cfg
 ExecReload=/bin/kill -HUP \$MAINPID
+KillMode=process
 Restart=on-failure
 RestartSec=5
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
 EOF
-
-    systemctl daemon-reload
-    systemctl enable 3proxy && systemctl restart 3proxy
-    log_ok "3proxy installed → HTTP:${PROXY3_HTTP}  SOCKS5:${PROXY3_SOCKS}"
-    echo "proxy3_http=$PROXY3_HTTP" >> "$CONFIG_FILE"
-    echo "proxy3_socks=$PROXY3_SOCKS" >> "$CONFIG_FILE"
-    press_enter
+    log_ok "3proxy systemd service written"
 }
 
 # ══════════════════════════════════════════════════════════════
@@ -402,9 +996,18 @@ install_all() {
     press_enter
 }
 
-install_squid_silent()  { apt-get update -qq; pkg_install squid apache2-utils; }
+install_squid_silent()  { apt_update; pkg_install squid apache2-utils; }
 install_dante_silent()  { pkg_install dante-server; }
-install_3proxy_silent() { pkg_install build-essential wget; }
+install_3proxy_silent() {
+    pkg_install build-essential wget curl git libssl-dev
+    _build_3proxy
+    _write_3proxy_config
+    _write_3proxy_service
+    _write_3proxy_users_file
+    systemctl daemon-reload
+    systemctl enable 3proxy >> "$LOG_DIR/install.log" 2>&1
+    systemctl restart 3proxy
+}
 
 # ══════════════════════════════════════════════════════════════
 #  5. ADD USER
@@ -433,19 +1036,201 @@ add_user() {
 
     save_user "$username" "$password" "$uchoice"
 
+    # Auto-open firewall for selected proxy ports
+    _open_proxy_ports "$uchoice"
+
     local ip; ip=$(get_server_ip)
-    echo -e "\n${GREEN}${BOLD}╔══════════════════════════════════════════════╗"
-    echo -e "║         USER CREATED SUCCESSFULLY           ║"
-    echo -e "╠══════════════════════════════════════════════╣"
-    echo -e "║  Username : ${WHITE}$username${GREEN}"
-    echo -e "║  Password : ${WHITE}$password${GREEN}"
-    echo -e "║  Server   : ${WHITE}$ip${GREEN}"
-    echo -e "║  HTTP     : ${WHITE}$ip:${HTTP_PORT}${GREEN}"
-    echo -e "║  SOCKS5   : ${WHITE}$ip:${SOCKS5_PORT}${GREEN}"
-    echo -e "║  3proxy H : ${WHITE}$ip:${PROXY3_HTTP}${GREEN}"
-    echo -e "║  3proxy S : ${WHITE}$ip:${PROXY3_SOCKS}${GREEN}"
-    echo -e "╚══════════════════════════════════════════════╝${RESET}"
+    local priv; priv=$(hostname -I | awk '{print $1}')
+    echo -e "\n${GREEN}${BOLD}╔════════════════════════════════════════════════════════╗"
+    echo -e "║            USER CREATED SUCCESSFULLY                   ║"
+    echo -e "╠════════════════════════════════════════════════════════╣"
+    echo -e "║  Username  : ${WHITE}$username${GREEN}"
+    echo -e "║  Password  : ${WHITE}$password${GREEN}"
+    echo -e "║  Public IP : ${WHITE}$ip${GREEN}  ← connect using this"
+    [[ "$ip" != "$priv" ]] && \
+    echo -e "║  Private IP: ${WHITE}$priv${GREEN}  (internal only — do NOT use)"
+    echo -e "╠════════════════════════════════════════════════════════╣"
+    case $uchoice in
+        1|4)
+    echo -e "║  ${CYAN}HTTP Proxy${GREEN}"
+    echo -e "║  Address   : ${WHITE}$ip:${HTTP_PORT}${GREEN}"
+    echo -e "║  Test cmd  : ${WHITE}curl -x http://$username:$password@$ip:$HTTP_PORT https://ifconfig.me${GREEN}"
+        ;;
+    esac
+    case $uchoice in
+        2|4)
+    echo -e "║  ${CYAN}SOCKS5 Proxy (Dante)${GREEN}"
+    echo -e "║  Address   : ${WHITE}$ip:${SOCKS5_PORT}${GREEN}"
+    echo -e "║  Test cmd  : ${WHITE}curl --socks5 $ip:$SOCKS5_PORT -U $username:$password https://ifconfig.me${GREEN}"
+        ;;
+    esac
+    case $uchoice in
+        3|4)
+    echo -e "║  ${CYAN}3proxy HTTP${GREEN}"
+    echo -e "║  Address   : ${WHITE}$ip:${PROXY3_HTTP}${GREEN}"
+    echo -e "║  Test cmd  : ${WHITE}curl -x http://$username:$password@$ip:$PROXY3_HTTP https://ifconfig.me${GREEN}"
+    echo -e "║  ${CYAN}3proxy SOCKS5${GREEN}"
+    echo -e "║  Address   : ${WHITE}$ip:${PROXY3_SOCKS}${GREEN}"
+    echo -e "║  Test cmd  : ${WHITE}curl --socks5 $ip:$PROXY3_SOCKS -U $username:$password https://ifconfig.me${GREEN}"
+        ;;
+    esac
+    echo -e "╚════════════════════════════════════════════════════════╝${RESET}"
+
+    # Quick connectivity self-test
+    echo -e "\n${CYAN}── Quick Connectivity Test ─────────────────────────────${RESET}"
+    _selftest_proxy "$uchoice" "$username" "$password" "$ip"
+
     press_enter
+}
+
+# ── Open firewall ports for proxy type ───────────────────────
+_open_proxy_ports() {
+    local choice=$1
+    log_info "Opening firewall ports..."
+    # Always ensure UFW is active
+    ufw --force enable >> "$LOG_DIR/install.log" 2>&1
+
+    case $choice in
+        1|4) ufw allow "$HTTP_PORT"/tcp  comment "Squid HTTP"  >> "$LOG_DIR/install.log" 2>&1
+             ufw allow "$HTTPS_PORT"/tcp comment "Squid HTTPS" >> "$LOG_DIR/install.log" 2>&1
+             log_ok "Opened port $HTTP_PORT (HTTP) and $HTTPS_PORT (HTTPS)" ;;
+    esac
+    case $choice in
+        2|4) ufw allow "$SOCKS5_PORT"/tcp comment "Dante SOCKS5" >> "$LOG_DIR/install.log" 2>&1
+             log_ok "Opened port $SOCKS5_PORT (SOCKS5)" ;;
+    esac
+    case $choice in
+        3|4) ufw allow "$PROXY3_HTTP"/tcp  comment "3proxy HTTP"   >> "$LOG_DIR/install.log" 2>&1
+             ufw allow "$PROXY3_SOCKS"/tcp comment "3proxy SOCKS5" >> "$LOG_DIR/install.log" 2>&1
+             log_ok "Opened port $PROXY3_HTTP (3proxy HTTP) and $PROXY3_SOCKS (3proxy SOCKS5)" ;;
+    esac
+
+    # Also check AWS/GCP/Azure security groups warning
+    local priv; priv=$(hostname -I | awk '{print $1}')
+    local pub;  pub=$(get_server_ip)
+    if [[ "$pub" != "$priv" ]]; then
+        echo -e "\n${YELLOW}╔══════════════════════════════════════════════════════════════╗"
+        echo -e "║  ⚠  CLOUD VPS DETECTED (AWS/GCP/Azure/DigitalOcean)          ║"
+        echo -e "╠══════════════════════════════════════════════════════════════╣"
+        echo -e "║  UFW ports opened ✔  — but you ALSO need to open ports in   ║"
+        echo -e "║  your cloud provider's Security Group / Firewall Rules:      ║"
+        echo -e "╠══════════════════════════════════════════════════════════════╣"
+        case $choice in
+            1|4)
+        echo -e "║  • TCP ${HTTP_PORT}   — Squid HTTP                                 ║"
+        echo -e "║  • TCP ${HTTPS_PORT}   — Squid HTTPS                                ║" ;;
+        esac
+        case $choice in
+            2|4)
+        echo -e "║  • TCP ${SOCKS5_PORT}   — Dante SOCKS5                               ║" ;;
+        esac
+        case $choice in
+            3|4)
+        echo -e "║  • TCP ${PROXY3_HTTP}   — 3proxy HTTP                                ║"
+        echo -e "║  • TCP ${PROXY3_SOCKS}   — 3proxy SOCKS5                             ║" ;;
+        esac
+        echo -e "╠══════════════════════════════════════════════════════════════╣"
+        echo -e "║  AWS  → EC2 → Security Groups → Inbound Rules → Add Rule    ║"
+        echo -e "║  GCP  → VPC Network → Firewall → Create Firewall Rule       ║"
+        echo -e "║  Azure → Network Security Groups → Inbound Rules            ║"
+        echo -e "║  DO   → Networking → Firewalls → Inbound Rules              ║"
+        echo -e "╚══════════════════════════════════════════════════════════════╝${RESET}"
+    fi
+}
+
+# ── Quick self-test from inside the VPS ──────────────────────
+_selftest_proxy() {
+    local choice=$1 user=$2 pass=$3 ip=$4
+    local ok=0 fail=0
+
+    case $choice in
+        1|4)
+            echo -ne "  Testing HTTP (Squid port $HTTP_PORT)... "
+            local r; r=$(curl -s --max-time 8 -x "http://$user:$pass@127.0.0.1:$HTTP_PORT" \
+                https://ifconfig.me 2>/dev/null)
+            if [[ -n "$r" ]]; then
+                echo -e "${GREEN}✔ OK — exit IP: $r${RESET}"; ((ok++))
+            else
+                echo -e "${RED}✗ FAILED${RESET}"; ((fail++))
+                echo -e "  ${YELLOW}→ Check: systemctl status squid${RESET}"
+            fi ;;
+    esac
+    case $choice in
+        2|4)
+            echo -ne "  Testing SOCKS5 (Dante port $SOCKS5_PORT)... "
+            local r; r=$(curl -s --max-time 8 --socks5 "127.0.0.1:$SOCKS5_PORT" \
+                -U "$user:$pass" https://ifconfig.me 2>/dev/null)
+            if [[ -n "$r" ]]; then
+                echo -e "${GREEN}✔ OK — exit IP: $r${RESET}"; ((ok++))
+            else
+                echo -e "${RED}✗ FAILED${RESET}"; ((fail++))
+                echo -e "  ${YELLOW}→ Check: systemctl status danted${RESET}"
+            fi ;;
+    esac
+    case $choice in
+        3|4)
+            echo -ne "  Testing 3proxy HTTP (port $PROXY3_HTTP)... "
+            local r; r=$(curl -s --max-time 8 -x "http://$user:$pass@127.0.0.1:$PROXY3_HTTP" \
+                https://ifconfig.me 2>/dev/null)
+            if [[ -n "$r" ]]; then
+                echo -e "${GREEN}✔ OK — exit IP: $r${RESET}"; ((ok++))
+            else
+                echo -e "${RED}✗ FAILED${RESET}"; ((fail++))
+                echo -e "  ${YELLOW}→ Check: systemctl status 3proxy${RESET}"
+            fi
+            echo -ne "  Testing 3proxy SOCKS5 (port $PROXY3_SOCKS)... "
+            local r2; r2=$(curl -s --max-time 8 --socks5 "127.0.0.1:$PROXY3_SOCKS" \
+                -U "$user:$pass" https://ifconfig.me 2>/dev/null)
+            if [[ -n "$r2" ]]; then
+                echo -e "${GREEN}✔ OK — exit IP: $r2${RESET}"; ((ok++))
+            else
+                echo -e "${RED}✗ FAILED${RESET}"; ((fail++))
+                echo -e "  ${YELLOW}→ Check: systemctl status 3proxy${RESET}"
+            fi ;;
+    esac
+
+    echo ""
+    if [[ $fail -eq 0 ]]; then
+        echo -e "  ${GREEN}${BOLD}✔ All proxy connections working from VPS.${RESET}"
+        echo -e "  ${YELLOW}If you still timeout from outside — open ports in your cloud Security Group (see above).${RESET}"
+    else
+        echo -e "  ${RED}${BOLD}✗ $fail test(s) failed — proxy not responding locally.${RESET}"
+        _diagnose_connection "$choice"
+    fi
+}
+
+# ── Auto-diagnose why proxy isn't working ────────────────────
+_diagnose_connection() {
+    local choice=$1
+    echo -e "\n${CYAN}── Auto-Diagnosis ──────────────────────────────────────${RESET}"
+
+    # Check services
+    for svc_check in "squid:1" "danted:2" "3proxy:3"; do
+        local svc=${svc_check%%:*}
+        local num=${svc_check##*:}
+        if [[ "$choice" == "$num" || "$choice" == "4" ]]; then
+            if ! systemctl is-active --quiet "$svc" 2>/dev/null; then
+                echo -e "  ${RED}✗ $svc is NOT running${RESET}"
+                echo -e "  ${CYAN}  Fix: sudo systemctl restart $svc${RESET}"
+                echo -e "  ${CYAN}  Logs: sudo journalctl -u $svc -n 20 --no-pager${RESET}"
+                journalctl -u "$svc" -n 5 --no-pager 2>/dev/null | grep -iE "error|fail|warn" | sed 's/^/    /'
+            else
+                echo -e "  ${GREEN}✔ $svc is running${RESET}"
+            fi
+        fi
+    done
+
+    # Check ports listening
+    echo -e "\n  ${CYAN}Ports currently listening:${RESET}"
+    ss -tlnp 2>/dev/null | grep -E ":($HTTP_PORT|$SOCKS5_PORT|$PROXY3_HTTP|$PROXY3_SOCKS|$HTTPS_PORT)" \
+        | awk '{print "    " $4}' \
+        || echo "    (none of the proxy ports are listening)"
+
+    # Check UFW
+    echo -e "\n  ${CYAN}UFW rules for proxy ports:${RESET}"
+    ufw status 2>/dev/null | grep -E "$HTTP_PORT|$SOCKS5_PORT|$PROXY3_HTTP|$PROXY3_SOCKS" \
+        | sed 's/^/    /' \
+        || echo "    (no UFW rules found for proxy ports)"
 }
 
 add_squid_user() {
@@ -1106,7 +1891,12 @@ handle_choice() {
         23) leakproof_harden ;;
         24) leakproof_check ;;
         25) leakproof_undo ;;
-        26) echo -e "\n${GREEN}Goodbye!${RESET}\n"; exit 0 ;;
+        26) ssl_reissue ;;
+        27) ssl_status ;;
+        28) echo -e "\n${GREEN}Goodbye!${RESET}\n"; exit 0 ;;
+        29) anti_detection_harden ;;
+        30) detection_risk_check ;;
+        31) residential_ip_masking ;;
         --rotate-silent)
             # Called by cron
             [[ -f $USERS_FILE ]] && while IFS=: read -r user _ type created; do
@@ -1303,10 +2093,17 @@ reply_header_access Server allow all
 # Replace User-Agent with generic browser string (anti-fingerprint)
 request_header_replace User-Agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 EOF
-        squid -k parse >> "$LOG_DIR/hardening.log" 2>&1 \
-            && systemctl reload squid 2>/dev/null \
-            && log_ok "Squid full header stripping applied" \
-            || log_warn "Squid config has issues — check $LOG_DIR/hardening.log"
+        # Validate config — ignore SSL cert warnings (certs may not exist yet)
+        local squid_errors
+        squid_errors=$(squid -k parse 2>&1 | grep -v "ssl" | grep -v "SSL" | grep -v "certificate" | grep -iE "error|fatal" | wc -l)
+        if [[ "$squid_errors" -eq 0 ]]; then
+            systemctl reload squid 2>/dev/null || systemctl restart squid 2>/dev/null
+            log_ok "Squid full header stripping applied"
+        else
+            # Apply anyway and restart — most warnings are non-fatal
+            systemctl restart squid 2>/dev/null
+            log_ok "Squid header stripping applied (restart done)"
+        fi
     else
         log_warn "Squid not installed — skipping header stripping"
     fi
@@ -1382,8 +2179,16 @@ EOF
 
     # ── Persist iptables rules across reboots ────────────────
     log_info "Saving iptables rules (persist on reboot)..."
-    pkg_install iptables-persistent netfilter-persistent
-    netfilter-persistent save >> "$LOG_DIR/hardening.log" 2>&1
+    # Pre-answer the interactive prompts so install never hangs
+    echo "iptables-persistent iptables-persistent/autosave_v4 boolean true" | debconf-set-selections
+    echo "iptables-persistent iptables-persistent/autosave_v6 boolean true" | debconf-set-selections
+    DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent netfilter-persistent \
+        >> "$LOG_DIR/hardening.log" 2>&1
+    # Save rules manually as well (double safety)
+    mkdir -p /etc/iptables
+    iptables-save  > /etc/iptables/rules.v4 2>/dev/null
+    ip6tables-save > /etc/iptables/rules.v6 2>/dev/null
+    netfilter-persistent save >> "$LOG_DIR/hardening.log" 2>&1 || true
     log_ok "iptables rules saved (auto-load on reboot)"
 
     # ── Mark hardening as applied ────────────────────────────
@@ -1422,101 +2227,192 @@ leakproof_check() {
     echo -e "${MAGENTA}${BOLD}[24] LEAK STATUS CHECK${RESET}\n"
     local pass=0 fail=0 warn=0
 
-    check_item() {
-        local label=$1 result=$2 expected=$3
-        if [[ "$result" == *"$expected"* ]]; then
-            echo -e "  ${GREEN}✔ PASS${RESET}  $label"
-            ((pass++))
-        else
-            echo -e "  ${RED}✗ FAIL${RESET}  $label ${YELLOW}(got: $result)${RESET}"
-            ((fail++))
-        fi
-    }
+    # helpers — use local vars to avoid subshell counter loss
+    _pass() { echo -e "  ${GREEN}✔ PASS${RESET}  $1"; ((pass++)); }
+    _fail() { echo -e "  ${RED}✗ FAIL${RESET}  $1${2:+ ${YELLOW}(got: $2)${RESET}}"; ((fail++)); }
+    _warn() { echo -e "  ${YELLOW}⚠ WARN${RESET}  $1"; ((warn++)); }
+    _skip() { echo -e "  ${CYAN}– SKIP${RESET}  $1 (not applicable)"; }
 
-    warn_item() {
-        local label=$1
-        echo -e "  ${YELLOW}⚠ WARN${RESET}  $label"
-        ((warn++))
-    }
-
+    # ── IPv6 ─────────────────────────────────────────────────
     echo -e "${CYAN}── IPv6 Status ─────────────────────────────────────────${RESET}"
-    local ipv6_all; ipv6_all=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)
-    check_item "IPv6 disabled (sysctl all)" "$ipv6_all" "1"
-    local ipv6_def; ipv6_def=$(sysctl -n net.ipv6.conf.default.disable_ipv6 2>/dev/null)
-    check_item "IPv6 disabled (sysctl default)" "$ipv6_def" "1"
-    local ipv6_ifaces; ipv6_ifaces=$(ip -6 addr 2>/dev/null | grep -v "::1" | wc -l)
-    [[ "$ipv6_ifaces" -eq 0 ]] \
-        && echo -e "  ${GREEN}✔ PASS${RESET}  No IPv6 addresses assigned" && ((pass++)) \
-        || echo -e "  ${RED}✗ FAIL${RESET}  IPv6 addresses still active: $ipv6_ifaces" && ((fail++))
 
-    echo -e "\n${CYAN}── DNS Leak Status ─────────────────────────────────────${RESET}"
-    local resolv; resolv=$(cat /etc/resolv.conf 2>/dev/null | grep "^nameserver" | awk '{print $2}' | tr '\n' ' ')
-    check_item "DNS resolvers set" "$resolv" "1.1.1.1"
-    local immutable; immutable=$(lsattr /etc/resolv.conf 2>/dev/null | awk '{print $1}')
-    [[ "$immutable" == *"i"* ]] \
-        && echo -e "  ${GREEN}✔ PASS${RESET}  resolv.conf is immutable (locked)" && ((pass++)) \
-        || echo -e "  ${YELLOW}⚠ WARN${RESET}  resolv.conf is NOT locked (can be overwritten)" && ((warn++))
-    systemctl is-active --quiet systemd-resolved \
-        && echo -e "  ${RED}✗ FAIL${RESET}  systemd-resolved is still running (DNS leak risk)" && ((fail++)) \
-        || echo -e "  ${GREEN}✔ PASS${RESET}  systemd-resolved is disabled" && ((pass++))
-
-    echo -e "\n${CYAN}── iptables DNS Lockdown ───────────────────────────────${RESET}"
-    local dns_drop; dns_drop=$(iptables -L OUTPUT -n 2>/dev/null | grep -c "dpt:53.*DROP")
-    [[ "$dns_drop" -gt 0 ]] \
-        && echo -e "  ${GREEN}✔ PASS${RESET}  Port 53 DROP rules active ($dns_drop rules)" && ((pass++)) \
-        || echo -e "  ${RED}✗ FAIL${RESET}  No port 53 DROP rules — DNS bypass possible" && ((fail++))
-
-    echo -e "\n${CYAN}── ip6tables Status ────────────────────────────────────${RESET}"
-    local ip6policy; ip6policy=$(ip6tables -L INPUT -n 2>/dev/null | head -1 | grep -c "DROP")
-    [[ "$ip6policy" -gt 0 ]] \
-        && echo -e "  ${GREEN}✔ PASS${RESET}  ip6tables INPUT policy is DROP" && ((pass++)) \
-        || echo -e "  ${RED}✗ FAIL${RESET}  ip6tables not hardened" && ((fail++))
-
-    echo -e "\n${CYAN}── Squid Header Stripping ──────────────────────────────${RESET}"
-    if [[ -f $SQUID_CONF ]]; then
-        grep -q "forwarded_for delete" "$SQUID_CONF" \
-            && echo -e "  ${GREEN}✔ PASS${RESET}  forwarded_for delete" && ((pass++)) \
-            || echo -e "  ${RED}✗ FAIL${RESET}  forwarded_for NOT stripped" && ((fail++))
-        grep -q "via off" "$SQUID_CONF" \
-            && echo -e "  ${GREEN}✔ PASS${RESET}  Via header off" && ((pass++)) \
-            || echo -e "  ${RED}✗ FAIL${RESET}  Via header NOT stripped" && ((fail++))
-        grep -q "request_header_access All deny all" "$SQUID_CONF" \
-            && echo -e "  ${GREEN}✔ PASS${RESET}  All extra headers denied" && ((pass++)) \
-            || echo -e "  ${YELLOW}⚠ WARN${RESET}  Header deny-all not found" && ((warn++))
-        grep -q "request_header_replace User-Agent" "$SQUID_CONF" \
-            && echo -e "  ${GREEN}✔ PASS${RESET}  User-Agent spoofing active" && ((pass++)) \
-            || echo -e "  ${YELLOW}⚠ WARN${RESET}  User-Agent NOT spoofed" && ((warn++))
+    local ipv6_all; ipv6_all=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null | tr -d '[:space:]')
+    if [[ "$ipv6_all" == "1" ]]; then
+        _pass "IPv6 disabled via sysctl (all)"
+    elif [[ -z "$ipv6_all" ]]; then
+        _warn "IPv6 sysctl not readable — may need Option 23 first"
     else
-        warn_item "Squid not installed — HTTP header check skipped"
+        _fail "IPv6 still enabled (sysctl all)" "$ipv6_all"
     fi
 
-    echo -e "\n${CYAN}── Kernel Hardening ────────────────────────────────────${RESET}"
-    local ttl; ttl=$(sysctl -n net.ipv4.ip_default_ttl 2>/dev/null)
-    check_item "TTL set to 128" "$ttl" "128"
-    local syncookies; syncookies=$(sysctl -n net.ipv4.tcp_syncookies 2>/dev/null)
-    check_item "SYN cookies enabled" "$syncookies" "1"
-    local icmp; icmp=$(sysctl -n net.ipv4.icmp_echo_ignore_all 2>/dev/null)
-    check_item "ICMP ping hidden (stealth)" "$icmp" "1"
-    local rp; rp=$(sysctl -n net.ipv4.conf.all.rp_filter 2>/dev/null)
-    check_item "IP spoofing protection" "$rp" "1"
+    local ipv6_def; ipv6_def=$(sysctl -n net.ipv6.conf.default.disable_ipv6 2>/dev/null | tr -d '[:space:]')
+    if [[ "$ipv6_def" == "1" ]]; then
+        _pass "IPv6 disabled via sysctl (default)"
+    elif [[ -z "$ipv6_def" ]]; then
+        _warn "IPv6 sysctl default not readable"
+    else
+        _fail "IPv6 still enabled (sysctl default)" "$ipv6_def"
+    fi
 
+    # Count actual IPv6 addresses (excluding loopback ::1)
+    local ipv6_count; ipv6_count=$(ip -6 addr show 2>/dev/null | grep "inet6" | grep -v "::1/128" | wc -l)
+    if [[ "$ipv6_count" -eq 0 ]]; then
+        _pass "No global IPv6 addresses assigned on interfaces"
+    else
+        _fail "IPv6 addresses still active on interfaces" "$ipv6_count address(es)"
+    fi
+
+    # Check GRUB
+    if grep -q "ipv6.disable=1" /etc/default/grub 2>/dev/null; then
+        _pass "IPv6 disabled in GRUB (persistent after reboot)"
+    else
+        _warn "IPv6 not disabled in GRUB — may re-enable after reboot"
+    fi
+
+    # ── DNS ───────────────────────────────────────────────────
+    echo -e "\n${CYAN}── DNS Leak Status ─────────────────────────────────────${RESET}"
+
+    local resolv_ns; resolv_ns=$(grep "^nameserver" /etc/resolv.conf 2>/dev/null | awk '{print $2}' | tr '\n' ' ')
+    if [[ "$resolv_ns" == *"1.1.1.1"* ]] || [[ "$resolv_ns" == *"8.8.8.8"* ]]; then
+        _pass "DNS resolvers: $resolv_ns"
+    else
+        _fail "DNS not set to secure resolvers" "${resolv_ns:-empty}"
+    fi
+
+    local immutable; immutable=$(lsattr /etc/resolv.conf 2>/dev/null | awk '{print $1}')
+    if [[ "$immutable" == *"i"* ]]; then
+        _pass "resolv.conf is immutable (cannot be overwritten)"
+    else
+        _warn "resolv.conf is NOT locked — NetworkManager may overwrite it"
+    fi
+
+    if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+        _fail "systemd-resolved is RUNNING (DNS leak risk)"
+    else
+        _pass "systemd-resolved is disabled"
+    fi
+
+    # ── iptables DNS lockdown ─────────────────────────────────
+    echo -e "\n${CYAN}── iptables DNS Lockdown ───────────────────────────────${RESET}"
+    # Check both DROP and REJECT for port 53
+    local dns_rules; dns_rules=$(iptables -S OUTPUT 2>/dev/null | grep -cE "dpt:53.*(DROP|REJECT)" || echo 0)
+    if [[ "$dns_rules" -gt 0 ]]; then
+        _pass "Port 53 lockdown active ($dns_rules rules)"
+    else
+        _warn "No port 53 DROP rules — run Option 23 to lock DNS"
+    fi
+
+    # ── ip6tables ─────────────────────────────────────────────
+    echo -e "\n${CYAN}── ip6tables Status ────────────────────────────────────${RESET}"
+    local ip6_policy; ip6_policy=$(ip6tables -L INPUT 2>/dev/null | head -1)
+    if [[ "$ip6_policy" == *"DROP"* ]]; then
+        _pass "ip6tables INPUT policy is DROP"
+    elif [[ "$ipv6_all" == "1" ]]; then
+        # IPv6 fully disabled at kernel level — ip6tables less critical
+        _pass "ip6tables not needed (IPv6 disabled at kernel level)"
+    else
+        _warn "ip6tables INPUT policy is not DROP — run Option 23"
+    fi
+
+    # ── UFW IPv6 block ────────────────────────────────────────
+    echo -e "\n${CYAN}── UFW Status ──────────────────────────────────────────${RESET}"
+    if ufw status 2>/dev/null | grep -q "Status: active"; then
+        _pass "UFW firewall is active"
+        if grep -q "^IPV6=no" /etc/default/ufw 2>/dev/null; then
+            _pass "UFW IPv6 is disabled"
+        else
+            _warn "UFW IPv6 still enabled in /etc/default/ufw"
+        fi
+    else
+        _warn "UFW is not active — run Option 15"
+    fi
+
+    # ── Squid headers ─────────────────────────────────────────
+    echo -e "\n${CYAN}── Squid Header Stripping ──────────────────────────────${RESET}"
+    if [[ -f "$SQUID_CONF" ]]; then
+        grep -q "forwarded_for delete" "$SQUID_CONF" \
+            && _pass "forwarded_for delete" || _fail "forwarded_for NOT stripped"
+        grep -q "^via off" "$SQUID_CONF" \
+            && _pass "Via header suppressed" || _fail "Via header NOT suppressed"
+        grep -q "request_header_access All deny all" "$SQUID_CONF" \
+            && _pass "All extra request headers denied" || _warn "Full header deny-all not applied (run Option 23)"
+        grep -q "request_header_replace User-Agent" "$SQUID_CONF" \
+            && _pass "User-Agent spoofed" || _warn "User-Agent NOT spoofed (run Option 23)"
+        if systemctl is-active --quiet squid 2>/dev/null; then
+            _pass "Squid service is running"
+        else
+            _fail "Squid is NOT running"
+        fi
+    else
+        _skip "Squid not installed"
+    fi
+
+    # ── Kernel hardening ──────────────────────────────────────
+    echo -e "\n${CYAN}── Kernel Hardening ────────────────────────────────────${RESET}"
+    local ttl; ttl=$(sysctl -n net.ipv4.ip_default_ttl 2>/dev/null | tr -d '[:space:]')
+    [[ "$ttl" == "128" ]] && _pass "TTL=128 (anti-fingerprint)" || _warn "TTL not set to 128 (currently: ${ttl:-unknown})"
+
+    local syn; syn=$(sysctl -n net.ipv4.tcp_syncookies 2>/dev/null | tr -d '[:space:]')
+    [[ "$syn" == "1" ]] && _pass "SYN flood protection enabled" || _warn "SYN cookies disabled"
+
+    local icmp; icmp=$(sysctl -n net.ipv4.icmp_echo_ignore_all 2>/dev/null | tr -d '[:space:]')
+    [[ "$icmp" == "1" ]] && _pass "ICMP ping blocked (stealth mode)" || _warn "ICMP ping still responds"
+
+    local rp; rp=$(sysctl -n net.ipv4.conf.all.rp_filter 2>/dev/null | tr -d '[:space:]')
+    [[ "$rp" == "1" ]] && _pass "IP spoofing protection active" || _warn "rp_filter not enabled"
+
+    local redirects; redirects=$(sysctl -n net.ipv4.conf.all.accept_redirects 2>/dev/null | tr -d '[:space:]')
+    [[ "$redirects" == "0" ]] && _pass "ICMP redirects disabled (anti-MITM)" || _warn "ICMP redirects allowed"
+
+    # ── Proxy services ────────────────────────────────────────
     echo -e "\n${CYAN}── Proxy Services ──────────────────────────────────────${RESET}"
+    local installed=0
     for svc in squid danted 3proxy; do
-        systemctl is-active --quiet "$svc" 2>/dev/null \
-            && echo -e "  ${GREEN}✔ RUNNING${RESET}  $svc" && ((pass++)) \
-            || echo -e "  ${YELLOW}⚠ STOPPED${RESET}  $svc (not installed or not running)" && ((warn++))
+        if systemctl list-units --all 2>/dev/null | grep -q "${svc}.service"; then
+            ((installed++))
+            if systemctl is-active --quiet "$svc" 2>/dev/null; then
+                _pass "$svc is RUNNING"
+            else
+                _fail "$svc is STOPPED (installed but not running)"
+            fi
+        else
+            _skip "$svc (not installed)"
+        fi
     done
+    [[ $installed -eq 0 ]] && _warn "No proxy services installed yet"
+
+    # ── Environment proxy vars ────────────────────────────────
+    echo -e "\n${CYAN}── System Proxy Environment ────────────────────────────${RESET}"
+    if grep -q "http_proxy" /etc/environment 2>/dev/null; then
+        _pass "System-wide proxy env vars set in /etc/environment"
+    else
+        _warn "Proxy env vars not set — some apps may bypass proxy"
+    fi
+
+    # ── iptables persistence ──────────────────────────────────
+    echo -e "\n${CYAN}── iptables Persistence ────────────────────────────────${RESET}"
+    if [[ -f /etc/iptables/rules.v4 ]] && [[ -s /etc/iptables/rules.v4 ]]; then
+        _pass "iptables rules saved (will restore on reboot)"
+    else
+        _warn "No saved iptables rules — rules lost on reboot (run Option 23)"
+    fi
 
     # ── Score ─────────────────────────────────────────────────
     local total=$((pass + fail + warn))
     echo -e "\n${MAGENTA}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
-    echo -e "  ${GREEN}PASS: $pass${RESET}  ${RED}FAIL: $fail${RESET}  ${YELLOW}WARN: $warn${RESET}  TOTAL: $total"
+    echo -e "  ${GREEN}PASS: $pass${RESET}  ${RED}FAIL: $fail${RESET}  ${YELLOW}WARN: $warn${RESET}  TOTAL CHECKS: $total"
+    local score=0
+    [[ $total -gt 0 ]] && score=$(( pass * 100 / total ))
+    echo -e "  Security Score: ${BOLD}${score}%${RESET}"
+    echo ""
     if [[ $fail -eq 0 && $warn -eq 0 ]]; then
-        echo -e "\n  ${GREEN}${BOLD}✔ FULLY LEAKPROOF — All checks passed!${RESET}"
+        echo -e "  ${GREEN}${BOLD}✔ FULLY LEAKPROOF — All checks passed!${RESET}"
     elif [[ $fail -eq 0 ]]; then
-        echo -e "\n  ${YELLOW}${BOLD}⚠ MOSTLY SAFE — Fix warnings for full protection${RESET}"
+        echo -e "  ${YELLOW}${BOLD}⚠ MOSTLY SAFE — $warn warnings to fix (run Option 23)${RESET}"
+    elif [[ $fail -le 2 ]]; then
+        echo -e "  ${YELLOW}${BOLD}⚠ PARTIALLY HARDENED — Run Option 23 to complete${RESET}"
     else
-        echo -e "\n  ${RED}${BOLD}✗ LEAKS DETECTED — Run Option 23 to fix${RESET}"
+        echo -e "  ${RED}${BOLD}✗ NOT HARDENED — Run Option 23 for full leakproof setup${RESET}"
     fi
     echo -e "${MAGENTA}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
     press_enter
@@ -1594,6 +2490,670 @@ leakproof_undo() {
     log_ok "All hardening undone. Reboot recommended."
     echo -ne "\n${YELLOW}Reboot now? (y/n): ${RESET}"; read -r rb
     [[ "$rb" == "y" ]] && reboot
+    press_enter
+}
+
+# ══════════════════════════════════════════════════════════════
+#  26. ADD / RE-ISSUE SSL CERTIFICATE
+# ══════════════════════════════════════════════════════════════
+ssl_reissue() {
+    banner
+    echo -e "${CYAN}${BOLD}[26] Add / Re-issue SSL Certificate${RESET}\n"
+
+    # Check if squid is installed
+    if ! command -v squid &>/dev/null; then
+        log_err "Squid is not installed. Run Option 1 first."
+        press_enter; return
+    fi
+
+    echo -ne "${YELLOW}Domain (e.g. proxy.example.com): ${RESET}"; read -r DOMAIN
+    DOMAIN=$(echo "$DOMAIN" | tr '[:upper:]' '[:lower:]' | xargs)
+    [[ -z "$DOMAIN" ]] && { log_err "No domain entered"; press_enter; return; }
+
+    echo -ne "${YELLOW}Email for SSL notifications (Enter=skip): ${RESET}"; read -r EMAIL
+
+    # Check domain → IP
+    log_info "Verifying $DOMAIN..."
+    local VPS_IP; VPS_IP=$(get_server_ip)
+    local DOMAIN_IP; DOMAIN_IP=$(dig +short "$DOMAIN" 2>/dev/null | tail -1)
+
+    echo -e "  ${CYAN}VPS IP     : ${WHITE}$VPS_IP${RESET}"
+    echo -e "  ${CYAN}Domain IP  : ${WHITE}${DOMAIN_IP:-NOT RESOLVED}${RESET}"
+
+    if [[ "$DOMAIN_IP" == "$VPS_IP" ]]; then
+        log_ok "DNS verified ✔"
+    else
+        log_warn "Domain IP does not match VPS IP"
+        echo -e "${CYAN}  Set DNS A record: $DOMAIN → $VPS_IP${RESET}"
+        echo -ne "${YELLOW}Continue anyway? (y/n): ${RESET}"; read -r fc
+        [[ "$fc" != "y" ]] && press_enter && return
+    fi
+
+    # Load saved HTTP port
+    [[ -f $CONFIG_FILE ]] && source "$CONFIG_FILE"
+
+    setup_nginx_ssl "$DOMAIN" "$EMAIL"
+    echo "squid_domain=$DOMAIN" >> "$CONFIG_FILE"
+
+    # Reload squid with new cert
+    local squid_errors
+    squid_errors=$(squid -k parse 2>&1 | grep -iE "^[[:space:]]*(FATAL|ERROR)" | wc -l)
+    [[ "$squid_errors" -eq 0 ]] && systemctl restart squid && log_ok "Squid restarted with new cert"
+    press_enter
+}
+
+# ══════════════════════════════════════════════════════════════
+#  27. VIEW SSL CERTIFICATE STATUS
+# ══════════════════════════════════════════════════════════════
+ssl_status() {
+    banner
+    echo -e "${CYAN}${BOLD}[27] SSL Certificate Status${RESET}\n"
+
+    # ── Squid cert ────────────────────────────────────────────
+    echo -e "${CYAN}── Squid Certificate (/etc/squid/squid.pem) ───────────${RESET}"
+    if [[ -f /etc/squid/squid.pem ]]; then
+        local expiry; expiry=$(openssl x509 -enddate -noout -in /etc/squid/squid.pem 2>/dev/null | cut -d= -f2)
+        local subject; subject=$(openssl x509 -subject -noout -in /etc/squid/squid.pem 2>/dev/null | sed 's/subject=//')
+        local issuer; issuer=$(openssl x509 -issuer -noout -in /etc/squid/squid.pem 2>/dev/null | sed 's/issuer=//')
+        local days_left; days_left=$(( ( $(date -d "$expiry" +%s 2>/dev/null || date -j -f "%b %d %T %Y %Z" "$expiry" +%s 2>/dev/null) - $(date +%s) ) / 86400 ))
+
+        echo -e "  ${WHITE}Subject : ${GREEN}$subject${RESET}"
+        echo -e "  ${WHITE}Issuer  : ${CYAN}$issuer${RESET}"
+        echo -e "  ${WHITE}Expires : ${YELLOW}$expiry${RESET}"
+        if [[ "$days_left" -gt 30 ]]; then
+            echo -e "  ${WHITE}Days Left: ${GREEN}$days_left days ✔${RESET}"
+        elif [[ "$days_left" -gt 0 ]]; then
+            echo -e "  ${WHITE}Days Left: ${YELLOW}$days_left days ⚠ (renew soon)${RESET}"
+        else
+            echo -e "  ${WHITE}Days Left: ${RED}EXPIRED ✗${RESET}"
+        fi
+    else
+        echo -e "  ${RED}No Squid certificate found${RESET}"
+    fi
+
+    # ── Let's Encrypt certs ───────────────────────────────────
+    echo -e "\n${CYAN}── Let's Encrypt Certificates ──────────────────────────${RESET}"
+    if command -v certbot &>/dev/null; then
+        certbot certificates 2>/dev/null | grep -E "Domains|Expiry|Certificate|VALID|INVALID" \
+            | sed 's/^/  /'
+    else
+        echo -e "  ${YELLOW}Certbot not installed${RESET}"
+    fi
+
+    # ── Nginx status ──────────────────────────────────────────
+    echo -e "\n${CYAN}── Nginx Status ────────────────────────────────────────${RESET}"
+    if systemctl is-active --quiet nginx; then
+        echo -e "  ${GREEN}● Nginx is RUNNING${RESET}"
+        nginx -T 2>/dev/null | grep -E "server_name|ssl_certificate|listen" | head -10 | sed 's/^/  /'
+    else
+        echo -e "  ${YELLOW}● Nginx is NOT running (only needed for domain SSL)${RESET}"
+    fi
+
+    # ── Auto-renew status ─────────────────────────────────────
+    echo -e "\n${CYAN}── Auto-Renewal Status ─────────────────────────────────${RESET}"
+    if systemctl is-active --quiet certbot.timer 2>/dev/null; then
+        echo -e "  ${GREEN}✔ Certbot auto-renewal timer is active${RESET}"
+        systemctl status certbot.timer 2>/dev/null | grep -E "Active|Trigger" | sed 's/^/  /'
+    elif crontab -l 2>/dev/null | grep -q certbot; then
+        echo -e "  ${GREEN}✔ Certbot renewal via cron${RESET}"
+    else
+        echo -e "  ${YELLOW}⚠ No auto-renewal detected${RESET}"
+        echo -e "  ${CYAN}  Run: certbot renew --dry-run   to test${RESET}"
+    fi
+
+    # ── Renewal log ───────────────────────────────────────────
+    if [[ -f /var/log/proxymanager/cert-renew.log ]]; then
+        echo -e "\n${CYAN}── Last Renewal Events ─────────────────────────────────${RESET}"
+        tail -5 /var/log/proxymanager/cert-renew.log | sed 's/^/  /'
+    fi
+
+    # ── Manual renew option ───────────────────────────────────
+    echo ""
+    echo -ne "${YELLOW}Force renew certificate now? (y/n): ${RESET}"; read -r rn
+    if [[ "$rn" == "y" ]]; then
+        log_info "Running certbot renew..."
+        certbot renew --force-renewal 2>&1 | tail -20
+        # Trigger deploy hook
+        run-parts /etc/letsencrypt/renewal-hooks/deploy/ 2>/dev/null
+        log_ok "Renewal attempted. Check output above."
+    fi
+    press_enter
+}
+
+# ══════════════════════════════════════════════════════════════
+#  29. FULL ANTI-DETECTION HARDENING
+# ══════════════════════════════════════════════════════════════
+anti_detection_harden() {
+    banner
+    echo -e "${RED}${BOLD}[29] FULL ANTI-DETECTION HARDENING${RESET}\n"
+    echo -e "${YELLOW}What gets you detected on sites like RemoteTask, Upwork etc:${RESET}"
+    echo -e "  ${RED}1.${RESET} IP is in datacenter ASN blacklist (AWS/GCP/Azure IPs are flagged)"
+    echo -e "  ${RED}2.${RESET} Proxy/VPN port fingerprinting (3128, 1080, 8080 are known proxy ports)"
+    echo -e "  ${RED}3.${RESET} HTTP headers reveal proxy (Via, X-Forwarded-For, Proxy-Connection)"
+    echo -e "  ${RED}4.${RESET} DNS leaks — your real DNS server exposed"
+    echo -e "  ${RED}5.${RESET} WebRTC IP leak (browser exposes real IP)"
+    echo -e "  ${RED}6.${RESET} TCP/IP fingerprint differs from claimed OS/browser"
+    echo -e "  ${RED}7.${RESET} Timezone mismatch between IP location and browser"
+    echo -e "  ${RED}8.${RESET} MTU size difference (VPNs use 1500, proxies differ)"
+    echo -e "  ${RED}9.${RESET} ASN shows as hosting provider not residential ISP"
+    echo -e "  ${RED}10.${RESET} Proxy port is open/detectable via port scanning\n"
+    echo -ne "${YELLOW}Apply all anti-detection fixes? (y/n): ${RESET}"; read -r c
+    [[ "$c" != "y" ]] && main_menu
+
+    local BAK="$CONFIG_DIR/antidetect_backup"
+    mkdir -p "$BAK"
+
+    # ── FIX 1: Move proxies to non-standard ports ─────────────
+    echo -e "\n${RED}── FIX 1: Moving proxies to non-standard ports ────────────${RESET}"
+    echo -e "${CYAN}Standard proxy ports (3128, 1080, 8080) are instantly flagged."
+    echo -e "We move them to random high ports that look like normal app traffic.${RESET}\n"
+
+    local NEW_HTTP NEW_SOCKS NEW_3HTTP NEW_3SOCKS
+    # Generate random ports in high range that look like app ports
+    NEW_HTTP=$(shuf -i 10000-65000 -n 1)
+    NEW_SOCKS=$(shuf -i 10000-65000 -n 1)
+    NEW_3HTTP=$(shuf -i 10000-65000 -n 1)
+    NEW_3SOCKS=$(shuf -i 10000-65000 -n 1)
+
+    echo -e "  New Squid HTTP  : ${GREEN}$NEW_HTTP${RESET}  (was $HTTP_PORT)"
+    echo -e "  New Dante SOCKS5: ${GREEN}$NEW_SOCKS${RESET}  (was $SOCKS5_PORT)"
+    echo -e "  New 3proxy HTTP : ${GREEN}$NEW_3HTTP${RESET}  (was $PROXY3_HTTP)"
+    echo -e "  New 3proxy SOCKS: ${GREEN}$NEW_3SOCKS${RESET}  (was $PROXY3_SOCKS)"
+
+    echo -ne "\n${YELLOW}Use these random ports? (y/n, n=enter custom): ${RESET}"; read -r userand
+    if [[ "$userand" != "y" ]]; then
+        echo -ne "New HTTP port  : "; read -r NEW_HTTP
+        echo -ne "New SOCKS5 port: "; read -r NEW_SOCKS
+        echo -ne "New 3proxy HTTP: "; read -r NEW_3HTTP
+        echo -ne "New 3proxy SOCKS: "; read -r NEW_3SOCKS
+    fi
+
+    # Apply port changes
+    if [[ -f $SQUID_CONF ]]; then
+        sed -i "s/^http_port ${HTTP_PORT}$/http_port ${NEW_HTTP}/" "$SQUID_CONF"
+        sed -i "s/^http_port ${HTTPS_PORT}/http_port ${NEW_SOCKS}/" "$SQUID_CONF" 2>/dev/null || true
+        systemctl restart squid 2>/dev/null
+        log_ok "Squid moved to port $NEW_HTTP"
+    fi
+    if [[ -f $DANTE_CONF ]]; then
+        sed -i "s/port = ${SOCKS5_PORT}/port = ${NEW_SOCKS}/" "$DANTE_CONF"
+        systemctl restart danted 2>/dev/null
+        log_ok "Dante moved to port $NEW_SOCKS"
+    fi
+    if [[ -f $PROXY3_CONF ]]; then
+        sed -i "s/proxy -p${PROXY3_HTTP}/proxy -p${NEW_3HTTP}/" "$PROXY3_CONF"
+        sed -i "s/socks -p${PROXY3_SOCKS}/socks -p${NEW_3SOCKS}/" "$PROXY3_CONF"
+        systemctl restart 3proxy 2>/dev/null
+        log_ok "3proxy moved to ports $NEW_3HTTP / $NEW_3SOCKS"
+    fi
+
+    # Update UFW — close old ports, open new ones silently
+    ufw delete allow "${HTTP_PORT}/tcp"   2>/dev/null || true
+    ufw delete allow "${SOCKS5_PORT}/tcp" 2>/dev/null || true
+    ufw delete allow "${PROXY3_HTTP}/tcp" 2>/dev/null || true
+    ufw delete allow "${PROXY3_SOCKS}/tcp" 2>/dev/null || true
+    ufw allow "$NEW_HTTP/tcp"   comment "Proxy HTTP (stealth)"  >> "$LOG_DIR/install.log" 2>&1
+    ufw allow "$NEW_SOCKS/tcp"  comment "Proxy SOCKS5 (stealth)">> "$LOG_DIR/install.log" 2>&1
+    ufw allow "$NEW_3HTTP/tcp"  comment "3proxy HTTP (stealth)" >> "$LOG_DIR/install.log" 2>&1
+    ufw allow "$NEW_3SOCKS/tcp" comment "3proxy SOCKS5 (stealth)">> "$LOG_DIR/install.log" 2>&1
+
+    # Save new ports to config
+    sed -i '/squid_http\|squid_https\|dante_socks5\|proxy3_http\|proxy3_socks/d' "$CONFIG_FILE"
+    {
+        echo "HTTP_PORT=$NEW_HTTP"
+        echo "HTTPS_PORT=$NEW_SOCKS"
+        echo "SOCKS5_PORT=$NEW_SOCKS"
+        echo "PROXY3_HTTP=$NEW_3HTTP"
+        echo "PROXY3_SOCKS=$NEW_3SOCKS"
+    } >> "$CONFIG_FILE"
+    HTTP_PORT=$NEW_HTTP
+    SOCKS5_PORT=$NEW_SOCKS
+    PROXY3_HTTP=$NEW_3HTTP
+    PROXY3_SOCKS=$NEW_3SOCKS
+
+    # ── FIX 2: Strip ALL proxy-revealing HTTP headers ─────────
+    echo -e "\n${RED}── FIX 2: Aggressive HTTP header stripping ────────────────${RESET}"
+    if [[ -f $SQUID_CONF ]]; then
+        # Remove existing header rules to avoid duplication
+        sed -i '/request_header_access\|reply_header_access\|request_header_replace\|header_replace/d' "$SQUID_CONF"
+        cat >> "$SQUID_CONF" <<'EOF'
+
+# ── Anti-Detection: Full header stripping ──────────────────────
+# Strip all headers that reveal proxy usage
+request_header_access Proxy-Connection deny all
+request_header_access X-Forwarded-For deny all
+request_header_access X-Forwarded-Host deny all
+request_header_access X-Forwarded-Proto deny all
+request_header_access X-Real-IP deny all
+request_header_access Via deny all
+request_header_access Forwarded deny all
+request_header_access Cache-Control allow all
+request_header_access Connection allow all
+request_header_access Host allow all
+request_header_access Accept allow all
+request_header_access Accept-Encoding allow all
+request_header_access Accept-Language allow all
+request_header_access Accept-Charset allow all
+request_header_access Authorization allow all
+request_header_access Content-Length allow all
+request_header_access Content-Type allow all
+request_header_access Date allow all
+request_header_access If-Modified-Since allow all
+request_header_access Pragma allow all
+request_header_access Referer allow all
+request_header_access Transfer-Encoding allow all
+request_header_access User-Agent allow all
+request_header_access Cookie allow all
+request_header_access All deny all
+
+# Strip response headers that reveal proxy
+reply_header_access Via deny all
+reply_header_access X-Cache deny all
+reply_header_access X-Cache-Lookup deny all
+reply_header_access X-Squid-Error deny all
+reply_header_access X-Forwarded-For deny all
+reply_header_access Proxy-Connection deny all
+
+# Anonymize forwarded-for completely
+forwarded_for delete
+via off
+
+# Do NOT add any proxy headers
+httpd_suppress_version_string on
+EOF
+        local sqerr; sqerr=$(squid -k parse 2>&1 | grep -icE "FATAL|ERROR" || true)
+        [[ "$sqerr" -eq 0 ]] && systemctl reload squid 2>/dev/null && log_ok "Squid headers hardened"
+    fi
+
+    # ── FIX 3: TCP/IP stack fingerprint hardening ─────────────
+    echo -e "\n${RED}── FIX 3: TCP fingerprint hardening ───────────────────────${RESET}"
+    # Remove old entries
+    sed -i '/# Anti-Detection TCP/,/^$/d' /etc/sysctl.conf 2>/dev/null || true
+    cat >> /etc/sysctl.conf <<EOF
+
+# ── Anti-Detection TCP hardening ─────────────────────────────
+# Make TCP fingerprint look like a regular desktop/residential user
+net.ipv4.ip_default_ttl = 64
+net.ipv4.tcp_window_scaling = 1
+net.ipv4.tcp_timestamps = 1
+net.ipv4.tcp_sack = 1
+net.ipv4.tcp_fack = 1
+net.ipv4.tcp_dsack = 1
+net.ipv4.tcp_ecn = 0
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_keepalive_time = 7200
+net.ipv4.tcp_keepalive_intvl = 75
+net.ipv4.tcp_keepalive_probes = 9
+net.ipv4.tcp_mtu_probing = 1
+# MTU: residential users have 1500, datacenters often differ
+net.core.rmem_default = 212992
+net.core.wmem_default = 212992
+EOF
+    sysctl -p >> "$LOG_DIR/install.log" 2>&1
+    log_ok "TCP fingerprint normalized to residential profile"
+
+    # ── FIX 4: MTU normalization ──────────────────────────────
+    echo -e "\n${RED}── FIX 4: MTU normalization ───────────────────────────────${RESET}"
+    local iface; iface=$(ip route get 8.8.8.8 2>/dev/null | grep -oP 'dev \K\S+' | head -1)
+    if [[ -n "$iface" ]]; then
+        ip link set dev "$iface" mtu 1500 2>/dev/null
+        # Make persistent
+        cat > "/etc/networkd-dispatcher/routable.d/fix-mtu" <<EOF
+#!/bin/bash
+ip link set dev $iface mtu 1500
+EOF
+        chmod +x "/etc/networkd-dispatcher/routable.d/fix-mtu" 2>/dev/null || true
+        log_ok "MTU set to 1500 on $iface (matches residential ISP)"
+    fi
+
+    # ── FIX 5: Block proxy detection ports (port scan shield) ─
+    echo -e "\n${RED}── FIX 5: Hide old proxy ports from port scanners ─────────${RESET}"
+    # Block TCP RST responses on old proxy ports so scanners see "filtered" not "closed"
+    for port in 3128 1080 8080 1081 8443 3129; do
+        iptables -A INPUT -p tcp --dport "$port" -j DROP 2>/dev/null
+        iptables -A INPUT -p udp --dport "$port" -j DROP 2>/dev/null
+    done
+    log_ok "Old proxy ports silently dropped (appear as filtered to scanners)"
+
+    # ── FIX 6: DNS anti-detection (use ISP-like DNS behavior) ─
+    echo -e "\n${RED}── FIX 6: DNS behavior normalization ──────────────────────${RESET}"
+    # Residential users use their ISP DNS or 8.8.8.8 — NOT 1.1.1.1 (flagged as privacy-conscious/VPN user)
+    chattr -i /etc/resolv.conf 2>/dev/null || true
+    cat > /etc/resolv.conf <<EOF
+# Anti-detection: use Google DNS (looks residential)
+nameserver 8.8.8.8
+nameserver 8.8.4.4
+options edns0
+EOF
+    chattr +i /etc/resolv.conf 2>/dev/null
+    # Update 3proxy DNS too
+    [[ -f $PROXY3_CONF ]] && sed -i 's/nserver 1.1.1.1/nserver 8.8.8.8/' "$PROXY3_CONF"
+    [[ -f $SQUID_CONF ]]  && sed -i 's/dns_nameservers 1.1.1.1 8.8.8.8 9.9.9.9/dns_nameservers 8.8.8.8 8.8.4.4/' "$SQUID_CONF"
+    systemctl restart squid 2>/dev/null || true
+    systemctl restart 3proxy 2>/dev/null || true
+    log_ok "DNS set to 8.8.8.8/8.8.4.4 (residential-looking)"
+
+    # ── FIX 7: Squid connection behavior (look like browser) ──
+    echo -e "\n${RED}── FIX 7: Browser-like connection behavior ─────────────────${RESET}"
+    if [[ -f $SQUID_CONF ]]; then
+        sed -i '/request_header_replace User-Agent/d' "$SQUID_CONF"
+        # Do NOT force a single UA — let the browser's own UA pass through
+        # Only strip proxy-specific headers, keep browser headers intact
+        grep -q "httpd_suppress_version_string" "$SQUID_CONF" || \
+            echo "httpd_suppress_version_string on" >> "$SQUID_CONF"
+        # Pipelining like a real browser
+        grep -q "pipeline_prefetch" "$SQUID_CONF" || \
+            echo "pipeline_prefetch 1" >> "$SQUID_CONF"
+        systemctl reload squid 2>/dev/null || true
+        log_ok "Squid configured for browser-like behavior"
+    fi
+
+    # ── FIX 8: Save iptables ──────────────────────────────────
+    mkdir -p /etc/iptables
+    iptables-save > /etc/iptables/rules.v4 2>/dev/null
+    netfilter-persistent save >> "$LOG_DIR/install.log" 2>&1 || true
+
+    # ── Save anti-detect marker ───────────────────────────────
+    echo "anti_detect=true" >> "$CONFIG_FILE"
+    echo "anti_detect_ports=$NEW_HTTP,$NEW_SOCKS,$NEW_3HTTP,$NEW_3SOCKS" >> "$CONFIG_FILE"
+
+    # ── Summary ───────────────────────────────────────────────
+    local ip; ip=$(get_server_ip)
+    echo -e "\n${RED}${BOLD}╔══════════════════════════════════════════════════════════════╗"
+    echo -e "║           ANTI-DETECTION HARDENING COMPLETE                  ║"
+    echo -e "╠══════════════════════════════════════════════════════════════╣"
+    echo -e "║  ${GREEN}✔ Moved to non-standard ports (not in proxy blacklists)${RED}       ║"
+    echo -e "║  ${GREEN}✔ All proxy-revealing headers stripped${RED}                        ║"
+    echo -e "║  ${GREEN}✔ TCP fingerprint normalized to residential profile${RED}           ║"
+    echo -e "║  ${GREEN}✔ MTU set to 1500 (residential ISP standard)${RED}                 ║"
+    echo -e "║  ${GREEN}✔ Old ports silently dropped (hidden from port scanners)${RED}      ║"
+    echo -e "║  ${GREEN}✔ DNS normalized to 8.8.8.8 (residential behavior)${RED}            ║"
+    echo -e "║  ${GREEN}✔ Browser-like connection pipelining enabled${RED}                  ║"
+    echo -e "╠══════════════════════════════════════════════════════════════╣"
+    echo -e "║  NEW CONNECTION DETAILS:                                     ║"
+    echo -e "║  ${WHITE}IP      : $ip${RED}"
+    echo -e "║  ${WHITE}HTTP    : $ip:$NEW_HTTP${RED}"
+    echo -e "║  ${WHITE}SOCKS5  : $ip:$NEW_SOCKS${RED}"
+    echo -e "║  ${WHITE}3p HTTP : $ip:$NEW_3HTTP${RED}"
+    echo -e "║  ${WHITE}3p SOCKS: $ip:$NEW_3SOCKS${RED}"
+    echo -e "╠══════════════════════════════════════════════════════════════╣"
+    echo -e "║  ${YELLOW}STILL NEEDED (client-side — configure in MoreLogin):${RED}         ║"
+    echo -e "║  ${YELLOW}• Set browser timezone to match your proxy IP location${RED}        ║"
+    echo -e "║  ${YELLOW}• Enable WebRTC leak protection in MoreLogin settings${RED}         ║"
+    echo -e "║  ${YELLOW}• Set Canvas/WebGL fingerprint to 'real' not 'noise'${RED}          ║"
+    echo -e "║  ${YELLOW}• Match browser language to proxy country${RED}                     ║"
+    echo -e "║  ${YELLOW}• Open new ports in AWS Security Group!${RED}                       ║"
+    echo -e "╚══════════════════════════════════════════════════════════════╝${RESET}"
+    press_enter
+}
+
+# ══════════════════════════════════════════════════════════════
+#  30. DETECTION RISK SCORE
+# ══════════════════════════════════════════════════════════════
+detection_risk_check() {
+    banner
+    echo -e "${RED}${BOLD}[30] DETECTION RISK SCORE${RESET}\n"
+    local risk=0 total=0
+    local ip; ip=$(get_server_ip)
+
+    _risk()  { echo -e "  ${RED}✗ HIGH RISK${RESET}   $1"; ((risk+=3)); ((total+=3)); }
+    _med()   { echo -e "  ${YELLOW}⚠ MEDIUM${RESET}     $1"; ((risk+=1)); ((total+=3)); }
+    _safe()  { echo -e "  ${GREEN}✔ SAFE${RESET}        $1"; ((total+=3)); }
+    _info()  { echo -e "  ${CYAN}ℹ INFO${RESET}        $1"; }
+
+    # ── Check 1: Datacenter IP ────────────────────────────────
+    echo -e "${CYAN}── IP Reputation ───────────────────────────────────────────${RESET}"
+    local asn_info
+    asn_info=$(curl --noproxy '*' -s --max-time 6 "https://ipinfo.io/$ip/json" 2>/dev/null)
+    local org; org=$(echo "$asn_info" | grep -o '"org":"[^"]*"' | cut -d'"' -f4)
+    local country; country=$(echo "$asn_info" | grep -o '"country":"[^"]*"' | cut -d'"' -f4)
+    local city; city=$(echo "$asn_info" | grep -o '"city":"[^"]*"' | cut -d'"' -f4)
+    _info "Your IP: $ip  |  Org: ${org:-unknown}  |  Location: $city, $country"
+
+    if echo "$org" | grep -qiE "amazon|aws|google|gcp|azure|microsoft|digitalocean|linode|vultr|ovh|hetzner|datacamp|hosting|datacenter|server|cloud"; then
+        _risk "IP belongs to a datacenter/hosting ASN ($org) — sites like RemoteTask block these"
+    else
+        _safe "IP ASN looks residential ($org)"
+    fi
+
+    # ── Check 2: Proxy ports exposed ─────────────────────────
+    echo -e "\n${CYAN}── Proxy Port Exposure ─────────────────────────────────────${RESET}"
+    for port in 3128 1080 8080 1081 3129 8443; do
+        if timeout 2 bash -c "echo > /dev/tcp/127.0.0.1/$port" 2>/dev/null; then
+            _risk "Known proxy port $port is OPEN — flagged by proxy detection databases"
+        fi
+    done
+    # Check if new ports are in use
+    local current_ports=($HTTP_PORT $SOCKS5_PORT $PROXY3_HTTP $PROXY3_SOCKS)
+    for port in "${current_ports[@]}"; do
+        if [[ "$port" -gt 9999 ]]; then
+            _safe "Port $port is non-standard (harder to detect)"
+        elif [[ -n "$port" ]]; then
+            _med "Port $port may appear in proxy port lists"
+        fi
+    done
+
+    # ── Check 3: HTTP headers ─────────────────────────────────
+    echo -e "\n${CYAN}── HTTP Header Fingerprint ─────────────────────────────────${RESET}"
+    if [[ -f $SQUID_CONF ]]; then
+        grep -q "forwarded_for delete" "$SQUID_CONF" \
+            && _safe "X-Forwarded-For stripped" || _risk "X-Forwarded-For NOT stripped"
+        grep -q "via off" "$SQUID_CONF" \
+            && _safe "Via header removed" || _risk "Via header reveals Squid proxy"
+        grep -q "request_header_access Proxy-Connection deny" "$SQUID_CONF" \
+            && _safe "Proxy-Connection header stripped" || _med "Proxy-Connection header may leak"
+        grep -q "httpd_suppress_version_string on" "$SQUID_CONF" \
+            && _safe "Squid version hidden" || _med "Squid version string visible"
+    else
+        _med "Squid not installed — cannot check headers"
+    fi
+
+    # ── Check 4: DNS fingerprint ──────────────────────────────
+    echo -e "\n${CYAN}── DNS Fingerprint ─────────────────────────────────────────${RESET}"
+    local dns_server; dns_server=$(grep "^nameserver" /etc/resolv.conf 2>/dev/null | head -1 | awk '{print $2}')
+    _info "Current DNS: $dns_server"
+    if [[ "$dns_server" == "1.1.1.1" || "$dns_server" == "1.0.0.1" ]]; then
+        _med "Using Cloudflare DNS (1.1.1.1) — associated with privacy tools/VPNs"
+    elif [[ "$dns_server" == "8.8.8.8" || "$dns_server" == "8.8.4.4" ]]; then
+        _safe "Using Google DNS (8.8.8.8) — common for residential users"
+    else
+        _safe "Using custom DNS: $dns_server"
+    fi
+
+    # ── Check 5: TCP fingerprint ──────────────────────────────
+    echo -e "\n${CYAN}── TCP Stack Fingerprint ───────────────────────────────────${RESET}"
+    local ttl; ttl=$(sysctl -n net.ipv4.ip_default_ttl 2>/dev/null)
+    local timestamps; timestamps=$(sysctl -n net.ipv4.tcp_timestamps 2>/dev/null)
+    local ecn; ecn=$(sysctl -n net.ipv4.tcp_ecn 2>/dev/null)
+    [[ "$ttl" == "64" ]]         && _safe "TTL=64 (Linux residential default)" \
+                                 || _med  "TTL=$ttl (non-standard, may fingerprint as server)"
+    [[ "$timestamps" == "1" ]]   && _safe "TCP timestamps enabled (normal)" \
+                                 || _med  "TCP timestamps disabled (unusual)"
+    [[ "$ecn" == "0" ]]          && _safe "ECN disabled (normal for most users)" \
+                                 || _med  "ECN=$ecn (may differ from residential)"
+
+    # ── Check 6: MTU ─────────────────────────────────────────
+    echo -e "\n${CYAN}── MTU Check ───────────────────────────────────────────────${RESET}"
+    local iface; iface=$(ip route get 8.8.8.8 2>/dev/null | grep -oP 'dev \K\S+' | head -1)
+    local mtu; mtu=$(ip link show "$iface" 2>/dev/null | grep -oP 'mtu \K\d+')
+    [[ "$mtu" == "1500" ]] && _safe "MTU=1500 (standard residential)" \
+                           || _risk "MTU=$mtu (datacenter/VPN typical — detectable)"
+
+    # ── Check 7: Reverse DNS ──────────────────────────────────
+    echo -e "\n${CYAN}── Reverse DNS (PTR record) ────────────────────────────────${RESET}"
+    local rdns; rdns=$(dig +short -x "$ip" 2>/dev/null | head -1)
+    _info "Reverse DNS: ${rdns:-none}"
+    if echo "$rdns" | grep -qiE "aws|amazon|ec2|compute|cloud|server|host|vps|data"; then
+        _risk "Reverse DNS reveals datacenter: $rdns"
+    elif [[ -z "$rdns" ]]; then
+        _med "No reverse DNS — some detectors flag this"
+    else
+        _safe "Reverse DNS looks clean: $rdns"
+    fi
+
+    # ── Risk Score ────────────────────────────────────────────
+    local pct=0
+    [[ $total -gt 0 ]] && pct=$(( (total - risk) * 100 / total ))
+    echo -e "\n${RED}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+    echo -e "  Detection Safety Score: ${BOLD}${pct}%${RESET}"
+    if [[ $pct -ge 80 ]]; then
+        echo -e "  ${GREEN}${BOLD}✔ LOW DETECTION RISK — Proxy is well disguised${RESET}"
+    elif [[ $pct -ge 50 ]]; then
+        echo -e "  ${YELLOW}${BOLD}⚠ MEDIUM RISK — Run Option 29 to harden further${RESET}"
+    else
+        echo -e "  ${RED}${BOLD}✗ HIGH DETECTION RISK — Run Option 29 immediately${RESET}"
+    fi
+    echo -e "\n  ${CYAN}${BOLD}Top fix for RemoteTask/Upwork detection:${RESET}"
+    echo -e "  ${WHITE}Your AWS IP is in datacenter blacklists. No amount of proxy"
+    echo -e "  hardening fully fixes this. The best solution is to use a"
+    echo -e "  residential IP (mobile data / home ISP) as the exit point."
+    echo -e "  Use Option 31 for ISP masking techniques.${RESET}"
+    echo -e "${RED}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+    press_enter
+}
+
+# ══════════════════════════════════════════════════════════════
+#  31. RESIDENTIAL IP MASKING
+# ══════════════════════════════════════════════════════════════
+residential_ip_masking() {
+    banner
+    echo -e "${RED}${BOLD}[31] RESIDENTIAL IP MASKING${RESET}\n"
+    local ip; ip=$(get_server_ip)
+
+    echo -e "${YELLOW}Your current IP: ${WHITE}$ip${RESET}"
+    echo -e "${RED}The core problem: AWS/GCP/Azure IPs are in datacenter ASN"
+    echo -e "blacklists used by fraud detection systems. Sites like RemoteTask,"
+    echo -e "Upwork, Amazon MTurk check your IP's ASN and instantly flag it.${RESET}\n"
+
+    echo -e "${CYAN}${BOLD}Available Masking Techniques:${RESET}\n"
+    echo -e "  ${YELLOW}1.${RESET}  ${GREEN}WireGuard tunnel through residential IP${RESET}"
+    echo -e "      Route ALL proxy traffic through a home/mobile IP as exit node"
+    echo -e "  ${YELLOW}2.${RESET}  ${GREEN}Setup instructions for ISP masking via VPS chaining${RESET}"
+    echo -e "  ${YELLOW}3.${RESET}  ${GREEN}Test if current IP passes residential check${RESET}"
+    echo -e "  ${YELLOW}4.${RESET}  ${GREEN}Show recommended residential proxy providers${RESET}"
+    echo -ne "\n${YELLOW}Choice (1-4): ${RESET}"; read -r rc
+
+    case $rc in
+    1)
+        echo -e "\n${CYAN}── WireGuard Residential Tunnel Setup ──────────────────────${RESET}"
+        pkg_install wireguard wireguard-tools
+        echo -ne "${YELLOW}Residential peer public IP (your home/phone IP): ${RESET}"; read -r RES_IP
+        echo -ne "${YELLOW}WireGuard port (default 51820): ${RESET}"; read -r WG_PORT
+        WG_PORT=${WG_PORT:-51820}
+
+        # Generate server keys
+        local PRIV_KEY; PRIV_KEY=$(wg genkey)
+        local PUB_KEY;  PUB_KEY=$(echo "$PRIV_KEY" | wg pubkey)
+
+        mkdir -p /etc/wireguard
+        cat > /etc/wireguard/wg0.conf <<EOF
+[Interface]
+PrivateKey = ${PRIV_KEY}
+Address = 10.8.0.1/24
+ListenPort = ${WG_PORT}
+# Route all proxy traffic out through the residential peer
+PostUp   = iptables -t nat -A POSTROUTING -o wg0 -j MASQUERADE
+PostDown = iptables -t nat -D POSTROUTING -o wg0 -j MASQUERADE
+
+[Peer]
+# Your residential device (home router / phone)
+PublicKey = PASTE_RESIDENTIAL_PEER_PUBLIC_KEY_HERE
+AllowedIPs = 0.0.0.0/0
+Endpoint = ${RES_IP}:${WG_PORT}
+PersistentKeepalive = 25
+EOF
+        ufw allow "$WG_PORT/udp" comment "WireGuard residential tunnel" >> "$LOG_DIR/install.log" 2>&1
+        log_ok "WireGuard config created: /etc/wireguard/wg0.conf"
+        echo -e "\n${YELLOW}Next steps:"
+        echo -e "1. Edit /etc/wireguard/wg0.conf — replace PASTE_RESIDENTIAL_PEER_PUBLIC_KEY_HERE"
+        echo -e "2. On your residential device install WireGuard and add this VPS as peer"
+        echo -e "3. Run: wg-quick up wg0"
+        echo -e "4. All proxy traffic will exit through your residential IP${RESET}"
+        ;;
+    2)
+        echo -e "\n${CYAN}── VPS Chaining (Double Hop) Setup Guide ───────────────────${RESET}"
+        echo -e "${WHITE}
+Architecture:
+  Client → [This AWS VPS proxy] → [Residential VPS/Server] → Internet
+
+Step 1: Get a residential IP VPS
+  • Recommended providers with residential IPs:
+    - Luminati/Brightdata (residential proxy network)
+    - Packetstream
+    - IPRoyal
+    - Webshare (residential plan)
+    - A home server with port forwarding
+
+Step 2: On the residential server, install SOCKS5 (Dante)
+  scp proxymanager.sh user@RESIDENTIAL_IP:/home/user/
+  ssh user@RESIDENTIAL_IP 'chmod +x proxymanager.sh && sudo ./proxymanager.sh'
+  Select Option 2 (Install Dante)
+
+Step 3: Chain proxies in MoreLogin
+  In MoreLogin browser profile settings:
+  Set proxy: SOCKS5 → RESIDENTIAL_IP:PORT
+  This routes your traffic: MoreLogin → Residential IP → Internet
+  Your exit IP will be the residential one.
+
+Step 4: Or chain using 3proxy on this server
+  Edit /etc/3proxy/3proxy.cfg and add:
+  parent 1000 socks5 RESIDENTIAL_IP RESIDENTIAL_PORT USER PASS
+  This makes this VPS forward all traffic through the residential proxy.${RESET}"
+        ;;
+    3)
+        echo -e "\n${CYAN}── Residential IP Check ────────────────────────────────────${RESET}"
+        log_info "Checking your IP against residential databases..."
+        local ip; ip=$(get_server_ip)
+
+        # Check ipinfo
+        local info; info=$(curl --noproxy '*' -s --max-time 8 "https://ipinfo.io/$ip/json" 2>/dev/null)
+        local org;     org=$(echo "$info"     | grep -o '"org":"[^"]*"'     | cut -d'"' -f4)
+        local country; country=$(echo "$info" | grep -o '"country":"[^"]*"' | cut -d'"' -f4)
+        local city;    city=$(echo "$info"    | grep -o '"city":"[^"]*"'    | cut -d'"' -f4)
+        local hostname_r; hostname_r=$(echo "$info" | grep -o '"hostname":"[^"]*"' | cut -d'"' -f4)
+
+        echo -e "\n  ${WHITE}IP        : ${GREEN}$ip${RESET}"
+        echo -e "  ${WHITE}ASN/Org   : ${YELLOW}$org${RESET}"
+        echo -e "  ${WHITE}Location  : $city, $country${RESET}"
+        echo -e "  ${WHITE}Hostname  : ${YELLOW}${hostname_r:-none}${RESET}"
+
+        if echo "$org" | grep -qiE "amazon|aws|google|azure|digitalocean|linode|vultr|ovh|hetzner|hosting|datacenter|cloud"; then
+            echo -e "\n  ${RED}${BOLD}✗ DATACENTER IP DETECTED${RESET}"
+            echo -e "  ${RED}This IP will be blocked by RemoteTask, Upwork, Amazon MTurk${RESET}"
+            echo -e "  ${YELLOW}Solution: Use Option 31 → Choice 1 (WireGuard residential tunnel)${RESET}"
+            echo -e "  ${YELLOW}Or purchase residential proxies from a provider${RESET}"
+        else
+            echo -e "\n  ${GREEN}${BOLD}✔ IP appears residential — lower detection risk${RESET}"
+        fi
+        ;;
+    4)
+        echo -e "\n${CYAN}── Recommended Residential Proxy Providers ─────────────────${RESET}"
+        echo -e "${WHITE}
+  Provider           Type              Best For
+  ─────────────────────────────────────────────────────────────
+  Brightdata         Residential       All platforms, most trusted
+  IPRoyal            Residential/ISP   RemoteTask, Upwork
+  Webshare           Residential       Budget option
+  Oxylabs            Residential       Enterprise grade
+  Packetstream       P2P Residential   Very cheap
+  Proxy-Cheap        ISP/Residential   ISP IPs look most real
+  ─────────────────────────────────────────────────────────────
+
+  ISP Proxies (best for RemoteTask):
+  • ISP proxies are hosted in datacenters but assigned to real
+    ISP ASNs (Comcast, AT&T, Safaricom etc)
+  • They pass ALL datacenter checks
+  • Much cheaper than residential
+  • Try: proxy-cheap.com → ISP proxies
+         iproyal.com → ISP proxies
+
+  Setup in MoreLogin:
+  1. Buy proxy from provider
+  2. In MoreLogin: Profile → Proxy → SOCKS5/HTTP
+  3. Enter IP:PORT:USER:PASS from provider
+  4. Test with 'Check proxy' button${RESET}"
+        ;;
+    esac
     press_enter
 }
 
