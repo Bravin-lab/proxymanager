@@ -490,7 +490,26 @@ save_user() {
     echo "$user:$pass:$type:$(ts)" >> "$USERS_FILE"
 }
 
-get_server_ip() { curl -s ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}'; }
+get_server_ip() {     local ip svc cache="$CONFIG_DIR/public_ip"
+    local re='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+
+    for svc in ifconfig.me api.ipify.org ipv4.icanhazip.com checkip.amazonaws.com ipinfo.io/ip; do
+        ip=$(env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
+             curl -4 -s --noproxy '*' --max-time 4 "https://$svc" 2>/dev/null | tr -d '[:space:]')
+        if [[ $ip =~ $re ]]; then
+            echo "$ip" > "$cache" 2>/dev/null
+            echo "$ip"; return 0
+        fi
+    done
+
+    # Offline fallback: last known public IP
+    if [[ -s $cache ]]; then
+        ip=$(cat "$cache")
+        [[ $ip =~ $re ]] && { echo "$ip"; return 0; }
+    fi
+
+    # Last resort: private IP
+    hostname -I | awk '{print $1}' }
 
 # ══════════════════════════════════════════════════════════════
 #  ACCOUNT EXPIRY HELPERS
