@@ -509,7 +509,8 @@ get_server_ip() {     local ip svc cache="$CONFIG_DIR/public_ip"
     fi
 
     # Last resort: private IP
-    hostname -I | awk '{print $1}' }
+    hostname -I | awk '{print $1}'
+}
 
 # ══════════════════════════════════════════════════════════════
 #  ACCOUNT EXPIRY HELPERS
